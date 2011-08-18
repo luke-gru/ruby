@@ -4,7 +4,7 @@ require 'rdoc/markup/pre_process'
 require 'rdoc/stats'
 
 ##
-# A parser is simple a class that implements
+# A parser is simply a class that implements
 #
 #   #initialize(file_name, body, options)
 #
@@ -18,8 +18,8 @@ require 'rdoc/stats'
 #
 # The ParseFactory is used to redirect to the correct parser given a
 # filename extension. This magic works because individual parsers have to
-# register themselves with us as they are loaded in. The do this using the
-# following incantation
+# register themselves with us as they are loaded in. They do this by using the
+# following:
 #
 #   require "rdoc/parser"
 #
@@ -45,8 +45,8 @@ class RDoc::Parser
   class << self
 
     ##
-    # A Hash that maps file extensions regular expressions to parsers that
-    # will consume them.
+    # An Array of arrays that maps file extension patterns to parsers that
+    # will parse them.
     #
     # Use parse_files_matching to register a parser's file extensions.
 

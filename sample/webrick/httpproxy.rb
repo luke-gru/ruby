@@ -2,8 +2,8 @@ require "webrick"
 require "webrick/httpproxy"
 
 # :ProxyContentHandler will be invoked before sending
-# response to User-Agenge. You can inspect the pair of
-# request and response messages (or can edit the response
+# response to User-Agent. You can inspect the pair of
+# request and response messages (or edit the response
 # message if necessary).
 
 pch = Proc.new{|req, res|

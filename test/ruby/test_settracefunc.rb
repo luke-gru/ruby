@@ -2978,6 +2978,36 @@ CODE
     assert_equal 0, results.select { |path| path.match?(/internal:gc/) }.size
   end
 
+  def test_tp_targeted_ractor_local
+    meth_name = "#{__method__}_method".to_sym
+    prok = Ractor.instance_eval do
+      proc { } # must be shareable or else can't call method in ractor
+    end
+    Ractor.make_shareable(prok)
+    klass = EnvUtil.labeled_class(:Klass) do
+      define_method(meth_name, &prok)
+    end
+    outer_results = {calls: 0}
+    outer_tp = TracePoint.new(:call) do
+      outer_results[:calls] += 1
+    end # not enabled
+    r = Ractor.new(meth_name, klass) do |mname, klass0|
+      inner_results = {:calls => 0}
+      tp = TracePoint.new(:call) { |tp| inner_results[:calls] += 1 }
+      target = klass0.instance_method(mname)
+      tp.enable(target: target)
+      obj = klass0.new
+      5.times { obj.send(mname) }
+      tp.disable
+      inner_results
+    end
+    inner_results = r.take
+    obj = klass.new
+    5.times { obj.send(meth_name) }
+    assert_equal 5, inner_results[:calls]
+    assert_equal 0, outer_results[:calls]
+  end
+
   def test_tracepoint_not_disabled_by_ractor_gc
     events = []
     tracepoint = TracePoint.new(:line) { |tp|

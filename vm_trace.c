@@ -125,6 +125,8 @@ update_global_event_hooks(rb_hook_list_t *list, rb_event_flag_t prev_events, rb_
     rb_event_flag_t enabled_iseq_events = ruby_vm_event_enabled_global_flags & ISEQ_TRACE_EVENTS;
     bool first_time_iseq_events_p = iseq_trace_set_all_needed(prev_events, new_events);
     bool clear_ccs = clear_ccs_needed(prev_events, new_events);
+    bool enable_call     = (prev_events & RUBY_EVENT_CALL)     == 0 && (new_events & RUBY_EVENT_CALL);
+    bool enable_return   = (prev_events & RUBY_EVENT_RETURN)   == 0 && (new_events & RUBY_EVENT_RETURN);
 
     // Modify ISEQs or CCs to enable tracing
     if (first_time_iseq_events_p) {

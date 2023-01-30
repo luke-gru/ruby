@@ -432,7 +432,9 @@ exec_hooks_protected(rb_execution_context_t *ec, rb_hook_list_t *list, const rb_
 void
 rb_exec_event_hooks(rb_trace_arg_t *trace_arg, rb_hook_list_t *hooks, int pop_p)
 {
+    VM_ASSERT(trace_arg);
     rb_execution_context_t *ec = trace_arg->ec;
+    VM_ASSERT(ec);
 
     if (UNLIKELY(trace_arg->event & RUBY_INTERNAL_EVENT_MASK)) {
         if (ec->trace_arg && (ec->trace_arg->event & RUBY_INTERNAL_EVENT_MASK)) {
@@ -442,8 +444,10 @@ rb_exec_event_hooks(rb_trace_arg_t *trace_arg, rb_hook_list_t *hooks, int pop_p)
             rb_trace_arg_t *prev_trace_arg = ec->trace_arg;
 
             ec->trace_arg = trace_arg;
+            VM_ASSERT(hooks);
+            VM_ASSERT(ec == GET_EC());
             /* only global hooks */
-            exec_hooks_unprotected(ec, rb_ec_ractor_hooks(ec), trace_arg);
+            exec_hooks_unprotected(ec, hooks, trace_arg);
             ec->trace_arg = prev_trace_arg;
         }
     }

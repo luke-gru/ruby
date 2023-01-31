@@ -199,10 +199,10 @@ hook_list_connect(VALUE list_owner, rb_hook_list_t *list, rb_event_hook_t *hook,
 }
 
 static void
-connect_event_hook(const rb_execution_context_t *ec, rb_event_hook_t *hook, int global_p)
+connect_event_hook(const rb_execution_context_t *ec, rb_event_hook_t *hook)
 {
     rb_hook_list_t *list = rb_ec_ractor_hooks(ec);
-    hook_list_connect(Qundef, list, hook, global_p);
+    hook_list_connect(Qundef, list, hook, TRUE);
 }
 
 static void
@@ -211,7 +211,7 @@ rb_threadptr_add_event_hook(const rb_execution_context_t *ec, rb_thread_t *th,
 {
     rb_event_hook_t *hook = alloc_event_hook(func, events, data, hook_flags);
     hook->filter.th = th;
-    connect_event_hook(ec, hook, TRUE);
+    connect_event_hook(ec, hook);
 }
 
 void
@@ -236,7 +236,7 @@ void
 rb_add_event_hook2(rb_event_hook_func_t func, rb_event_flag_t events, VALUE data, rb_event_hook_flag_t hook_flags)
 {
     rb_event_hook_t *hook = alloc_event_hook(func, events, data, hook_flags);
-    connect_event_hook(GET_EC(), hook, TRUE);
+    connect_event_hook(GET_EC(), hook);
 }
 
 static void
@@ -432,9 +432,7 @@ exec_hooks_protected(rb_execution_context_t *ec, rb_hook_list_t *list, const rb_
 void
 rb_exec_event_hooks(rb_trace_arg_t *trace_arg, rb_hook_list_t *hooks, int pop_p)
 {
-    VM_ASSERT(trace_arg);
     rb_execution_context_t *ec = trace_arg->ec;
-    VM_ASSERT(ec);
 
     if (UNLIKELY(trace_arg->event & RUBY_INTERNAL_EVENT_MASK)) {
         if (ec->trace_arg && (ec->trace_arg->event & RUBY_INTERNAL_EVENT_MASK)) {
@@ -444,8 +442,6 @@ rb_exec_event_hooks(rb_trace_arg_t *trace_arg, rb_hook_list_t *hooks, int pop_p)
             rb_trace_arg_t *prev_trace_arg = ec->trace_arg;
 
             ec->trace_arg = trace_arg;
-            VM_ASSERT(hooks);
-            VM_ASSERT(ec == GET_EC());
             /* only global hooks */
             exec_hooks_unprotected(ec, hooks, trace_arg);
             ec->trace_arg = prev_trace_arg;

@@ -1354,9 +1354,10 @@ CODE
     assert !defined?(MISSING_CONSTANT_59398)
     TracePoint.new(:c_call, :c_return, :call, :return){|tp|
       next if !target_thread?
-      next unless tp.defined_class == Module
+      next unless tp.defined_class == Module || tp.defined_class == Test::Unit::TestCase.singleton_class
       # rake/ext/module.rb aliases :const_missing and Ruby uses the aliased name
-      # but this only happens when running the full test suite
+      # but this only happens when running the full test suite.
+      # Test::Unit::TestCase also redefines const_missing.
       events << [tp.event,tp.method_id] if tp.method_id == :const_missing || tp.method_id == :rake_original_const_missing
     }.enable{
       MISSING_CONSTANT_59398 rescue nil
@@ -1370,8 +1371,10 @@ CODE
       ], events, bug59398)
     else
       assert_equal([
+        [:call, :const_missing],
         [:c_call, :const_missing],
-        [:c_return, :const_missing]
+        [:c_return, :const_missing],
+        [:return, :const_missing],
       ], events, bug59398)
     end
   end

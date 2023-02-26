@@ -940,6 +940,7 @@ class TestNetHTTP_v1_2 < Test::Unit::TestCase
 end
 
 class TestNetHTTP_v1_2_chunked < Test::Unit::TestCase
+ self.make_uncollectible!
   CONFIG = {
     'host' => '127.0.0.1',
     'proxy_host' => nil,

@@ -105,6 +105,7 @@ class TestERB < Test::Unit::TestCase
 end
 
 class TestERBCore < Test::Unit::TestCase
+  class MyError < RuntimeError ; end
   def setup
     @erb = ERB
   end
@@ -365,11 +366,11 @@ EOS
 
   def test_def_method_without_filename
     klass = Class.new
-    erb = ERB.new("<% raise ::TestERB::MyError %>")
+    erb = ERB.new("<% raise ::TestERBCore::MyError %>")
     erb.filename = "test filename"
     assert_not_respond_to(klass.new, 'my_error')
     erb.def_method(klass, 'my_error')
-    e = assert_raise(::TestERB::MyError) {
+    e = assert_raise(MyError) {
        klass.new.my_error
     }
     assert_match(/\A\(ERB\):1\b/, e.backtrace[0])
@@ -377,11 +378,11 @@ EOS
 
   def test_def_method_with_fname
     klass = Class.new
-    erb = ERB.new("<% raise ::TestERB::MyError %>")
+    erb = ERB.new("<% raise ::TestERBCore::MyError %>")
     erb.filename = "test filename"
     assert_not_respond_to(klass.new, 'my_error')
     erb.def_method(klass, 'my_error', 'test fname')
-    e = assert_raise(::TestERB::MyError) {
+    e = assert_raise(MyError) {
        klass.new.my_error
     }
     assert_match(/\Atest fname:1\b/, e.backtrace[0])

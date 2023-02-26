@@ -25,9 +25,9 @@ module Test
         io
       end
 
-      def _run_suites(suites, type) # :nodoc:
-        suites.map do |suite|
-          _run_suite(suite, type)
+      def _run_suites(suite_names, type) # :nodoc:
+        suite_names.each do |suite_name|
+          _run_suite(suite_name, type)
         end
       end
 
@@ -35,7 +35,7 @@ module Test
         _report "start", Marshal.dump([inst.class.name, inst.__name__])
       end
 
-      def _run_suite(suite, type) # :nodoc:
+      def _run_suite(suite_name, type) # :nodoc:
         @partial_report = []
         orig_testout = Test::Unit::Runner.output
         i,o = IO.pipe
@@ -55,7 +55,7 @@ module Test
         e, f, s = @errors, @failures, @skips
 
         begin
-          result = orig_run_suite(suite, type)
+          result = orig_run_suite(suite_name, type)
         rescue Interrupt
           @need_exit = true
           result = [nil,nil]
@@ -77,7 +77,7 @@ module Test
         @partial_report = nil
         result << [@errors-e,@failures-f,@skips-s]
         result << ($: - @old_loadpath)
-        result << suite.name
+        result << suite_name
 
         _report "done", Marshal.dump(result)
         return result
@@ -116,7 +116,7 @@ module Test
               _report "okay"
 
               @options = @opts.dup
-              suites = Test::Unit::TestCase.test_suites
+              suites_before = Test::Unit::TestCase.test_suites
 
               begin
                 require File.realpath($1)
@@ -125,7 +125,9 @@ module Test
                 _report "ready"
                 next
               end
-              _run_suites Test::Unit::TestCase.test_suites-suites, $2.to_sym
+
+              suites = Test::Unit::TestCase.test_suites - suites_before
+              _run_suites suites.map(&:name), $2.to_sym
 
               if @need_exit
                 _report "bye"

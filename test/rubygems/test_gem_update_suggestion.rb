@@ -4,6 +4,8 @@ require "rubygems/command"
 require "rubygems/update_suggestion"
 
 class TestUpdateSuggestion < Gem::TestCase
+  self.make_uncollectible!
+
   def setup
     super
 

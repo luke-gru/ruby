@@ -2,10 +2,11 @@
 # frozen_string_literal: false
 
 require_relative "helper"
+require "envutil"
 
 class TestCSVEncodings < Test::Unit::TestCase
   extend DifferentOFS
-  include Helper
+  include CSVHelper
 
   def setup
     super
@@ -263,7 +264,7 @@ class TestCSVEncodings < Test::Unit::TestCase
   end
 
   def test_encoding_with_default_internal
-    with_default_internal(Encoding::UTF_8) do
+    EnvUtil.with_default_internal(Encoding::UTF_8) do
       s = CSV.generate(String.new(encoding: Encoding::Big5), encoding: Encoding::Big5) do |csv|
         csv << ["漢字"]
       end

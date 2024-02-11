@@ -3169,6 +3169,7 @@ struct obj_traverse_replace_data {
 struct obj_traverse_replace_callback_data {
     bool stop;
     VALUE src;
+    VALUE replacement;
     struct obj_traverse_replace_data *data;
 };
 
@@ -3223,7 +3224,15 @@ obj_iv_hash_traverse_replace_i(st_data_t * _key, st_data_t * val, st_data_t ptr,
     }
     else if (*(VALUE *)val != data->replacement) {
         VALUE v = *(VALUE *)val = data->replacement;
-        RB_OBJ_WRITTEN(d->src, Qundef, v);
+        if (data->move) {
+            RB_OBJ_WRITTEN(d->replacement, Qundef, v);
+        }
+        else {
+            RB_OBJ_WRITTEN(d->src, Qundef, v);
+        }
+    }
+    else if (data->move) {
+        RB_OBJ_WRITTEN(d->src, Qundef, data->replacement);
     }
 
     return ST_CONTINUE;
@@ -3294,7 +3303,12 @@ obj_traverse_replace_i(VALUE obj, struct obj_traverse_replace_data *data)
 #define CHECK_AND_REPLACE(v) do { \
     VALUE _val = (v); \
     if (obj_traverse_replace_i(_val, data)) { return 1; } \
-    else if (data->replacement != _val)     { RB_OBJ_WRITE(obj, &v, data->replacement); } \
+    else if (data->replacement != _val) { \
+        RB_OBJ_WRITE(obj, &v, data->replacement); \
+    } \
+    if (data->move) { \
+        RB_OBJ_WRITTEN(replacement, Qundef, data->replacement); \
+    } \
 } while (0)
 
     if (UNLIKELY(FL_TEST_RAW(obj, FL_EXIVAR))) {
@@ -3306,6 +3320,7 @@ obj_traverse_replace_i(VALUE obj, struct obj_traverse_replace_data *data)
                 .stop = false,
                 .data = data,
                 .src = obj,
+                .replacement = replacement,
             };
             rb_st_foreach_with_replace(
                 ivtbl->as.complex.table,
@@ -3344,6 +3359,7 @@ obj_traverse_replace_i(VALUE obj, struct obj_traverse_replace_data *data)
                     .stop = false,
                     .data = data,
                     .src = obj,
+                    .replacement = replacement,
                 };
                 rb_st_foreach_with_replace(
                     ROBJECT_IV_HASH(obj),
@@ -3387,6 +3403,7 @@ obj_traverse_replace_i(VALUE obj, struct obj_traverse_replace_data *data)
                 .stop = false,
                 .data = data,
                 .src = obj,
+                .replacement = replacement,
             };
             rb_hash_stlike_foreach_with_replace(obj,
                                                 obj_hash_traverse_replace_foreach_i,

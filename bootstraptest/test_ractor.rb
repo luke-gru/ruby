@@ -1108,6 +1108,18 @@ values = r.take
 values.join
 }
 
+# moved objects have their singleton class properly set in ractor
+assert_equal 'hi', %q{
+r = Ractor.new do
+  obj = receive
+  obj.hi
+end
+obj = Object.new
+def obj.hi = "hi"
+r.send(obj, move: true)
+r.take
+}
+
 # cvar in shareable-objects are not allowed to access from non-main Ractor
 assert_equal 'can not access class variables from non-main Ractors', %q{
   class C

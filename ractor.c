@@ -15,6 +15,7 @@
 #include "internal/rational.h"
 #include "internal/struct.h"
 #include "internal/thread.h"
+#include "internal/object.h"
 #include "variable.h"
 #include "yjit.h"
 #include "rjit.h"
@@ -3520,7 +3521,13 @@ move_enter(VALUE obj, struct obj_traverse_replace_data *data)
         return traverse_skip;
     }
     else {
-        VALUE moved = rb_obj_alloc(RBASIC_CLASS(obj));
+        // if obj has singleton class, basic_class and real_class will differ
+        VALUE basic_class = RBASIC_CLASS(obj);
+        VALUE real_class = rb_class_real(basic_class);
+        VALUE moved = rb_obj_alloc(real_class);
+        if (basic_class != real_class) {
+            RBASIC_SET_CLASS(moved, basic_class);
+        }
         rb_shape_set_shape(moved, rb_shape_get_shape(obj));
         data->replacement = moved;
         return traverse_cont;
@@ -3544,6 +3551,11 @@ move_leave(VALUE obj, struct obj_traverse_replace_data *data)
 
     if (UNLIKELY(FL_TEST_RAW(obj, FL_EXIVAR))) {
         rb_replace_generic_ivar(v, obj);
+    }
+
+    VALUE basic_class = RBASIC_CLASS(v);
+    if (FL_TEST(basic_class, FL_SINGLETON)) {
+        rb_singleton_class_attached(basic_class, v);
     }
 
     // TODO: generic_ivar

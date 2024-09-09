@@ -10024,11 +10024,8 @@ compile_attrasgn(rb_iseq_t *iseq, LINK_ANCHOR *const ret, const NODE *const node
 }
 
 static int
-compile_make_shareable_node(rb_iseq_t *iseq, LINK_ANCHOR *ret, LINK_ANCHOR *sub, const NODE *value, bool copy)
+compile_make_shareable_node(rb_iseq_t *iseq, LINK_ANCHOR *ret, const NODE *value, bool copy)
 {
-    ADD_INSN1(ret, value, putspecialobject, INT2FIX(VM_SPECIAL_OBJECT_VMCORE));
-    ADD_SEQ(ret, sub);
-
     if (copy) {
         /*
          * NEW_CALL(fcore, rb_intern("make_shareable_copy"),
@@ -10117,9 +10114,24 @@ compile_ensure_shareable_node(rb_iseq_t *iseq, LINK_ANCHOR *ret, NODE *dest, con
     VALUE path = const_decl_path(dest);
     ADD_INSN1(ret, value, putspecialobject, INT2FIX(VM_SPECIAL_OBJECT_VMCORE));
     CHECK(COMPILE(ret, "compile_ensure_shareable_node", value));
-    ADD_INSN1(ret, value, putobject, path);
     RB_OBJ_WRITTEN(iseq, Qundef, path);
+    ADD_INSN1(ret, value, putobject, path);
     ADD_SEND_WITH_FLAG(ret, value, rb_intern("ensure_shareable"), INT2FIX(2), INT2FIX(VM_CALL_ARGS_SIMPLE));
+    return COMPILE_OK;
+}
+
+static int
+compile_hash_ensure_shareable(rb_iseq_t *iseq, LINK_ANCHOR *ret, NODE *dest, const NODE *value)
+{
+    VALUE path = const_decl_path(dest);
+    ADD_INSN1(ret, value, putspecialobject, INT2FIX(VM_SPECIAL_OBJECT_VMCORE));
+    CHECK(compile_hash(iseq, ret, value, FALSE, 0));
+    ADD_SEND(ret, value, idFreeze, INT2FIX(0));
+    RB_OBJ_WRITTEN(iseq, Qundef, path);
+    ADD_INSN1(ret, value, putobject, path);
+    ADD_SEND_WITH_FLAG(ret, value, rb_intern("ensure_shareable"), INT2FIX(2), INT2FIX(VM_CALL_ARGS_SIMPLE));
+
+
 
     return COMPILE_OK;
 }
@@ -10129,10 +10141,10 @@ compile_ensure_shareable_node(rb_iseq_t *iseq, LINK_ANCHOR *ret, NODE *dest, con
 #endif
 
 static int
-compile_shareable_literal_constant(rb_iseq_t *iseq, LINK_ANCHOR *ret, enum rb_parser_shareability shareable, NODE *dest, const NODE *node, size_t level, VALUE *value_p, int *shareable_literal_p)
+compile_shareable_constant(rb_iseq_t *iseq, LINK_ANCHOR *ret, enum rb_parser_shareability shareable, NODE *dest, const NODE *node, size_t level, VALUE *value_p, int *shareable_literal_p)
 {
-# define compile_shareable_literal_constant_next(node, anchor, value_p, shareable_literal_p) \
-    compile_shareable_literal_constant(iseq, anchor, shareable, dest, node, level+1, value_p, shareable_literal_p)
+# define compile_shareable_constant_next(node, anchor, value_p, shareable_literal_p) \
+    compile_shareable_constant(iseq, anchor, shareable, dest, node, level+1, value_p, shareable_literal_p)
     VALUE lit = Qnil;
     DECL_ANCHOR(anchor);
 
@@ -10191,7 +10203,7 @@ compile_shareable_literal_constant(rb_iseq_t *iseq, LINK_ANCHOR *ret, enum rb_pa
         return COMPILE_OK;
 
       case NODE_STR:{
-        VALUE lit = rb_node_str_string_val(node);
+        VALUE lit = rb_node_str_string_val(node); /* always a frozen string */
         ADD_INSN1(ret, node, putobject, lit);
         RB_OBJ_WRITTEN(iseq, Qundef, lit);
         *value_p = lit;
@@ -10223,13 +10235,13 @@ compile_shareable_literal_constant(rb_iseq_t *iseq, LINK_ANCHOR *ret, enum rb_pa
 
       case NODE_LIST:{
         INIT_ANCHOR(anchor);
-        lit = rb_ary_new();
+        lit = rb_ary_new_capa(RNODE_LIST(node)->as.nd_alen);
         for (NODE *n = (NODE *)node; n; n = RNODE_LIST(n)->nd_next) {
             VALUE val;
             int shareable_literal_p2;
             NODE *elt = RNODE_LIST(n)->nd_head;
             if (elt) {
-                CHECK(compile_shareable_literal_constant_next(elt, anchor, &val, &shareable_literal_p2));
+                CHECK(compile_shareable_constant_next(elt, anchor, &val, &shareable_literal_p2));
                 if (shareable_literal_p2) {
                     /* noop */
                 }
@@ -10251,6 +10263,7 @@ compile_shareable_literal_constant(rb_iseq_t *iseq, LINK_ANCHOR *ret, enum rb_pa
         break;
       }
       case NODE_HASH:{
+        bool uses_keyword_splat = false;
         if (!RNODE_HASH(node)->nd_brace) {
             *value_p = Qundef;
             *shareable_literal_p = 0;
@@ -10258,7 +10271,7 @@ compile_shareable_literal_constant(rb_iseq_t *iseq, LINK_ANCHOR *ret, enum rb_pa
         }
 
         INIT_ANCHOR(anchor);
-        lit = rb_hash_new();
+        lit = rb_hash_new_capa(RNODE_LIST(RNODE_HASH(node)->nd_head)->as.nd_alen);
         for (NODE *n = RNODE_HASH(node)->nd_head; n; n = RNODE_LIST(RNODE_LIST(n)->nd_next)->nd_next) {
             VALUE key_val;
             VALUE value_val;
@@ -10266,7 +10279,7 @@ compile_shareable_literal_constant(rb_iseq_t *iseq, LINK_ANCHOR *ret, enum rb_pa
             NODE *key = RNODE_LIST(n)->nd_head;
             NODE *val = RNODE_LIST(RNODE_LIST(n)->nd_next)->nd_head;
             if (key) {
-                CHECK(compile_shareable_literal_constant_next(key, anchor, &key_val, &shareable_literal_p2));
+                CHECK(compile_shareable_constant_next(key, anchor, &key_val, &shareable_literal_p2));
                 if (shareable_literal_p2) {
                     /* noop */
                 }
@@ -10276,7 +10289,14 @@ compile_shareable_literal_constant(rb_iseq_t *iseq, LINK_ANCHOR *ret, enum rb_pa
                 }
             }
             if (val) {
-                CHECK(compile_shareable_literal_constant_next(val, anchor, &value_val, &shareable_literal_p2));
+                if (!key) {
+                    uses_keyword_splat = true;
+                    if (RTEST(lit)) {
+                        rb_hash_clear(lit);
+                    }
+                    break;
+                }
+                CHECK(compile_shareable_constant_next(val, anchor, &value_val, &shareable_literal_p2));
                 if (shareable_literal_p2) {
                     /* noop */
                 }
@@ -10295,6 +10315,19 @@ compile_shareable_literal_constant(rb_iseq_t *iseq, LINK_ANCHOR *ret, enum rb_pa
                 }
             }
         }
+
+        if (uses_keyword_splat) {
+            if (shareable == rb_parser_shareable_literal &&
+                (SHAREABLE_BARE_EXPRESSION || level > 0)) {
+                CHECK(compile_hash_ensure_shareable(iseq, ret, dest, node));
+                *shareable_literal_p = 1;
+            } else {
+                CHECK(compile_hash(iseq, ret, node, FALSE, 0));
+                *shareable_literal_p = 0;
+            }
+            *value_p = Qundef;
+            return COMPILE_OK;
+        }
         break;
       }
 
@@ -10306,14 +10339,15 @@ compile_shareable_literal_constant(rb_iseq_t *iseq, LINK_ANCHOR *ret, enum rb_pa
             *shareable_literal_p = 1;
             return COMPILE_OK;
         }
-        CHECK(COMPILE(ret, "shareable_literal_constant", node));
+        CHECK(COMPILE(ret, "shareable_constant_literal", node));
         *value_p = Qundef;
         *shareable_literal_p = 0;
         return COMPILE_OK;
     }
 
-    /* Array or Hash */
-    if (!lit) {
+    RUBY_ASSERT(nd_type(node) == NODE_LIST || nd_type(node) == NODE_HASH);
+    /* Array or Hash, parent function will make it shareable at runtime */
+    if (!lit || NIL_P(lit)) {
         if (nd_type(node) == NODE_LIST) {
             ADD_INSN1(anchor, node, newarray, INT2FIX(RNODE_LIST(node)->as.nd_alen));
         }
@@ -10326,28 +10360,15 @@ compile_shareable_literal_constant(rb_iseq_t *iseq, LINK_ANCHOR *ret, enum rb_pa
         ADD_SEQ(ret, anchor);
         return COMPILE_OK;
     }
-    if (NIL_P(lit)) {
-        // if shareable_literal, all elements should have been ensured
-        // as shareable
-        if (nd_type(node) == NODE_LIST) {
-            ADD_INSN1(anchor, node, newarray, INT2FIX(RNODE_LIST(node)->as.nd_alen));
-        }
-        else if (nd_type(node) == NODE_HASH) {
-            int len = (int)RNODE_LIST(RNODE_HASH(node)->nd_head)->as.nd_alen;
-            ADD_INSN1(anchor, node, newhash, INT2FIX(len));
-        }
-        CHECK(compile_make_shareable_node(iseq, ret, anchor, node, false));
-        *value_p = Qundef;
-        *shareable_literal_p = 1;
+    /* make literal hash or array shareable at compile time */
+    if (level == 0) { /* it will recursively make it all shareable */
+        lit = rb_ractor_make_shareable(lit);
+        ADD_INSN1(ret, node, putobject, lit);
+        RB_OBJ_WRITTEN(iseq, Qundef, lit);
     }
-    else {
-        VALUE val = rb_ractor_make_shareable(lit);
-        ADD_INSN1(ret, node, putobject, val);
-        RB_OBJ_WRITTEN(iseq, Qundef, val);
-        *value_p = val;
-        *shareable_literal_p = 1;
-    }
-
+    *value_p = lit;
+    *shareable_literal_p = 1;
+    RB_GC_GUARD(lit);
     return COMPILE_OK;
 }
 
@@ -10356,6 +10377,8 @@ compile_shareable_constant_value(rb_iseq_t *iseq, LINK_ANCHOR *ret, enum rb_pars
 {
     int literal_p = 0;
     VALUE val;
+    DECL_ANCHOR(before);
+    DECL_ANCHOR(during);
     DECL_ANCHOR(anchor);
     INIT_ANCHOR(anchor);
 
@@ -10365,19 +10388,20 @@ compile_shareable_constant_value(rb_iseq_t *iseq, LINK_ANCHOR *ret, enum rb_pars
         return COMPILE_OK;
 
       case rb_parser_shareable_literal:
-        CHECK(compile_shareable_literal_constant(iseq, anchor, shareable, (NODE *)lhs, value, 0, &val, &literal_p));
-        ADD_SEQ(ret, anchor);
-        return COMPILE_OK;
-
       case rb_parser_shareable_copy:
       case rb_parser_shareable_everything:
-        CHECK(compile_shareable_literal_constant(iseq, anchor, shareable, (NODE *)lhs, value, 0, &val, &literal_p));
+        INIT_ANCHOR(before);
+        INIT_ANCHOR(during);
+        ADD_INSN1(before, value, putspecialobject, INT2FIX(VM_SPECIAL_OBJECT_VMCORE)); /* for make_shareable call */
+        CHECK(compile_shareable_constant(iseq, during, shareable, (NODE *)lhs, value, 0, &val, &literal_p));
         if (!literal_p) {
-            CHECK(compile_make_shareable_node(iseq, ret, anchor, value, shareable == rb_parser_shareable_copy));
+            ADD_SEQ(anchor, before);
+            ADD_SEQ(anchor, during);
+            CHECK(compile_make_shareable_node(iseq, anchor, value, shareable == rb_parser_shareable_copy));
+        } else {
+            ADD_SEQ(anchor, during);
         }
-        else {
-            ADD_SEQ(ret, anchor);
-        }
+        ADD_SEQ(ret, anchor);
         return COMPILE_OK;
       default:
         rb_bug("unexpected rb_parser_shareability: %d", shareable);

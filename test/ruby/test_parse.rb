@@ -1609,6 +1609,18 @@ x = __ENCODING__
     assert_ractor_shareable(a[0])
   end
 
+  def test_shareable_constant_value_kwsplat
+    a = eval_separately("#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      # shareable_constant_value: experimental_everything
+      a = {"foo" => "bar"}
+      A = {**a}
+      A
+    end;
+    assert_ractor_shareable(a)
+    assert_equal({"foo" => "bar"}, a)
+  end
+
   def test_shareable_constant_value_unshareable_literal
     assert_raise_separately(Ractor::IsolationError, /unshareable object to C/,
                             "#{<<~"begin;"}\n#{<<~'end;'}")

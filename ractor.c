@@ -3080,8 +3080,8 @@ VALUE
 rb_ractor_ensure_shareable(VALUE obj, VALUE name)
 {
     if (!rb_ractor_shareable_p(obj)) {
-        VALUE message = rb_sprintf("cannot assign unshareable object to %"PRIsVALUE,
-                                   name);
+        VALUE message = rb_sprintf("cannot assign unshareable object to %"PRIsVALUE", object: %s\n",
+                                   name, RSTRING_PTR(rb_str_ellipsize(rb_inspect(obj), 100)));
         rb_exc_raise(rb_exc_new_str(rb_eRactorIsolationError, message));
     }
     return obj;

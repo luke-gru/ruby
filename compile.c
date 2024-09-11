@@ -4786,6 +4786,10 @@ static_literal_value(const NODE *node, rb_iseq_t *iseq)
     }
 }
 
+
+#define ARY_MAX_STACK_LEN 0x100
+#define ARY_MIN_TMP_LEN 0x40
+
 static int
 compile_array(rb_iseq_t *iseq, LINK_ANCHOR *const ret, const NODE *node, int popped, bool first_chunk)
 {
@@ -4818,7 +4822,7 @@ compile_array(rb_iseq_t *iseq, LINK_ANCHOR *const ret, const NODE *node, int pop
      * However, there are three points.
      *
      * - The code above causes stack overflow for a big string literal.
-     *   The following limits the stack length up to max_stack_len.
+     *   The following limits the stack length up to ARY_MAX_STACK_LEN
      *
      *   [x1,x2,...,x10000] =>
      *     push x1  ; push x2  ; ...; push x256; newarray 256;
@@ -4844,8 +4848,6 @@ compile_array(rb_iseq_t *iseq, LINK_ANCHOR *const ret, const NODE *node, int pop
      *     putobject 1; putobject 2; putobject 3; newarray 3; ...; pushtoarraykwsplat kw
      */
 
-    const int max_stack_len = 0x100;
-    const int min_tmp_ary_len = 0x40;
     int stack_len = 0;
 
     /* Either create a new array, or push to the existing array */
@@ -4867,7 +4869,7 @@ compile_array(rb_iseq_t *iseq, LINK_ANCHOR *const ret, const NODE *node, int pop
             for (; node_tmp && static_literal_node_p(RNODE_LIST(node_tmp)->nd_head, iseq, false); node_tmp = RNODE_LIST(node_tmp)->nd_next)
                 count++;
 
-            if ((first_chunk && stack_len == 0 && !node_tmp) || count >= min_tmp_ary_len) {
+            if ((first_chunk && stack_len == 0 && !node_tmp) || count >= ARY_MIN_TMP_LEN) {
                 /* The literal contains only optimizable elements, or the subarray is long enough */
                 VALUE ary = rb_ary_hidden_new(count);
 
@@ -4914,7 +4916,7 @@ compile_array(rb_iseq_t *iseq, LINK_ANCHOR *const ret, const NODE *node, int pop
             }
 
             /* If there are many pushed elements, flush them to avoid stack overflow */
-            if (stack_len >= max_stack_len) FLUSH_CHUNK;
+            if (stack_len >= ARY_MAX_STACK_LEN) FLUSH_CHUNK;
         }
     }
 
@@ -4962,7 +4964,7 @@ compile_hash(rb_iseq_t *iseq, LINK_ANCHOR *const ret, const NODE *node, int meth
      *   Sometimes we need to insert the receiver, so "anchor" is needed.
      *   In addition, a method call is much slower than concatarray.
      *   So it pays only when the subsequence is really long.
-     *   (min_tmp_hash_len must be much larger than min_tmp_ary_len.)
+     *   (min_tmp_hash_len must be much larger than ARY_MIN_TMP_LEN.)
      *
      * - We need to handle keyword splat: **kw.
      *   For **kw, the key part (node->nd_head) is NULL, and the value part
@@ -4970,7 +4972,6 @@ compile_hash(rb_iseq_t *iseq, LINK_ANCHOR *const ret, const NODE *node, int meth
      *   The code is a bit difficult to avoid hash allocation for **{}.
      */
 
-    const int max_stack_len = 0x100;
     const int min_tmp_hash_len = 0x800;
     int stack_len = 0;
     int first_chunk = 1;
@@ -5052,7 +5053,7 @@ compile_hash(rb_iseq_t *iseq, LINK_ANCHOR *const ret, const NODE *node, int meth
                 stack_len += 2;
 
                 /* If there are many pushed elements, flush them to avoid stack overflow */
-                if (stack_len >= max_stack_len) FLUSH_CHUNK();
+                if (stack_len >= ARY_MAX_STACK_LEN) FLUSH_CHUNK();
             }
             else {
                 /* kwsplat case: foo(..., **kw, ...) */
@@ -10102,8 +10103,12 @@ static VALUE
 const_decl_path(NODE *dest)
 {
     VALUE path = Qnil;
-    if (!nd_type_p(dest, NODE_CALL)) {
-        path = node_const_decl_val(dest);
+    switch (nd_type(dest)) {
+      case NODE_CDECL:
+      case NODE_COLON2:
+      case NODE_COLON3:
+          path = node_const_decl_val(dest);
+          break;
     }
     return path;
 }
@@ -10136,6 +10141,7 @@ compile_shareable_literal_constant(rb_iseq_t *iseq, LINK_ANCHOR *ret, enum rb_pa
     VALUE lit = Qnil;
     DECL_ANCHOR(anchor);
 
+    bool already_array = false;
     enum node_type type = nd_type(node);
     switch (type) {
       case NODE_TRUE:
@@ -10223,31 +10229,92 @@ compile_shareable_literal_constant(rb_iseq_t *iseq, LINK_ANCHOR *ret, enum rb_pa
 
       case NODE_LIST:{
         INIT_ANCHOR(anchor);
-        lit = rb_ary_new();
-        for (NODE *n = (NODE *)node; n; n = RNODE_LIST(n)->nd_next) {
-            VALUE val;
-            int shareable_literal_p2;
-            NODE *elt = RNODE_LIST(n)->nd_head;
-            if (elt) {
-                CHECK(compile_shareable_literal_constant_next(elt, anchor, &val, &shareable_literal_p2));
-                if (shareable_literal_p2) {
-                    /* noop */
-                }
-                else if (RTEST(lit)) {
-                    rb_ary_clear(lit);
-                    lit = Qfalse;
-                }
+        int stack_len = 0;
+        NODE *n = (NODE*)node;
+        const NODE *line_node = node;
+#define FLUSH_CHUNK \
+        if (stack_len) {                                            \
+            if (first_chunk) ADD_INSN1(anchor, line_node, newarray, INT2FIX(stack_len)); \
+            else ADD_INSN1(anchor, line_node, pushtoarray, INT2FIX(stack_len));     \
+            first_chunk = FALSE; \
+            stack_len = 0;                            \
+            already_array = true; \
+        }
+
+        bool first_chunk = TRUE;
+        lit = Qnil;
+        while (n) {
+            int count = 1;
+            /* pre-allocation check */
+            /* count the elements that are optimizable */
+            const NODE *node_tmp = n;
+            for (; node_tmp && static_literal_node_p(RNODE_LIST(node_tmp)->nd_head, iseq, false); node_tmp = RNODE_LIST(node_tmp)->nd_next) {
+                count++;
             }
-            if (RTEST(lit)) {
-                if (!UNDEF_P(val)) {
-                    rb_ary_push(lit, val);
+            if ((first_chunk && stack_len == 0 && !node_tmp) || count >= ARY_MIN_TMP_LEN) {
+                /* The literal contains only optimizable elements, or the subarray is long enough */
+                VALUE ary = rb_ary_new_capa(count);
+
+                /* Create a hidden array */
+                for (; count > 1; count--, n = RNODE_LIST(n)->nd_next) {
+                    rb_ary_push(ary, static_literal_value(RNODE_LIST(n)->nd_head, iseq));
+
+                }
+
+                bool is_only_literal = (node_tmp == NULL);
+                if (is_only_literal) {
+                    ary = rb_ractor_make_shareable(ary);
+                } else {
+                    OBJ_FREEZE(ary);
+                }
+                RB_OBJ_WRITTEN(iseq, Qundef, ary);
+
+                /* Emit optimized code */
+                FLUSH_CHUNK;
+                if (first_chunk) {
+                    if (is_only_literal) {
+                        ADD_INSN1(anchor, line_node, putobject, ary);
+                    } else {
+                        ADD_INSN1(anchor, line_node, duparray, ary);
+                    }
+                    lit = ary;
+                    first_chunk = FALSE;
+                    already_array = true;
                 }
                 else {
-                    rb_ary_clear(lit);
-                    lit = Qnil; /* make shareable at runtime */
+                    if (is_only_literal) {
+                        ADD_INSN1(anchor, line_node, putobject, ary);
+                    } else {
+                        ADD_INSN1(anchor, line_node, duparray, ary);
+                    }
+                    ADD_INSN(anchor, line_node, concattoarray);
+                    already_array = true;
+                    lit = Qnil;
                 }
+                RB_GC_GUARD(ary);
+            }
+
+            /* Base case: Compile "count" elements */
+            for (; count && n; count--, n = RNODE_LIST(n)->nd_next) {
+                NODE *elt = RNODE_LIST(n)->nd_head;
+                RUBY_ASSERT(elt);
+                VALUE val;
+                int shareable_literal_p2;
+                if (CPDEBUG > 0) {
+                    EXPECT_NODE("compile_array", n, NODE_LIST, -1);
+                }
+
+                CHECK(compile_shareable_literal_constant_next(elt, anchor, &val, &shareable_literal_p2));
+                already_array = false;
+                lit = Qnil;
+                stack_len++;
+
+                /* If there are many pushed elements, flush them to avoid stack overflow */
+                if (stack_len >= ARY_MAX_STACK_LEN) FLUSH_CHUNK;
             }
         }
+        FLUSH_CHUNK;
+#undef FLUSH_CHUNK
         break;
       }
       case NODE_HASH:{
@@ -10329,22 +10396,28 @@ compile_shareable_literal_constant(rb_iseq_t *iseq, LINK_ANCHOR *ret, enum rb_pa
     if (NIL_P(lit)) {
         // if shareable_literal, all elements should have been ensured
         // as shareable
-        if (nd_type(node) == NODE_LIST) {
-            ADD_INSN1(anchor, node, newarray, INT2FIX(RNODE_LIST(node)->as.nd_alen));
-        }
-        else if (nd_type(node) == NODE_HASH) {
+        if (nd_type(node) == NODE_HASH) {
             int len = (int)RNODE_LIST(RNODE_HASH(node)->nd_head)->as.nd_alen;
             ADD_INSN1(anchor, node, newhash, INT2FIX(len));
+        } else {
+            if (!already_array) {
+                ADD_INSN1(anchor, node, newarray, INT2FIX(RNODE_LIST(node)->as.nd_alen));
+            }
         }
         CHECK(compile_make_shareable_node(iseq, ret, anchor, node, false));
         *value_p = Qundef;
         *shareable_literal_p = 1;
     }
     else {
-        VALUE val = rb_ractor_make_shareable(lit);
-        ADD_INSN1(ret, node, putobject, val);
-        RB_OBJ_WRITTEN(iseq, Qundef, val);
-        *value_p = val;
+        if (RB_OBJ_SHAREABLE_P(lit)) {
+            *value_p = lit;
+            ADD_SEQ(ret, anchor);
+        } else {
+            VALUE val = rb_ractor_make_shareable(lit);
+            ADD_INSN1(ret, node, putobject, val);
+            RB_OBJ_WRITTEN(iseq, Qundef, val);
+            *value_p = val;
+        }
         *shareable_literal_p = 1;
     }
 

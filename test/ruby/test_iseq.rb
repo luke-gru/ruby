@@ -185,6 +185,77 @@ class TestISeq < Test::Unit::TestCase
     assert_includes iseq.to_binary, "REGEX".b
   end
 
+  def test_ractor_constant_all_literals
+    iseq = RubyVM::InstructionSequence.compile(<<~'RUBY')
+      # shareable_constant_value: literal
+      RACTOR_CONST = [1,2,3,4,5]
+    RUBY
+    assert_equal iseq.eval, [1,2,3,4,5]
+  ensure
+    Object.send(:remove_const, :RACTOR_CONST) if Object.const_defined?(:RACTOR_CONST)
+  end
+
+  def test_ractor_constant_all_non_literals
+    iseq = RubyVM::InstructionSequence.compile(<<~'RUBY')
+      # shareable_constant_value: literal
+      a, b, c, d = 1,2,3,4
+      RACTOR_CONST = [a, b, c, d]
+    RUBY
+    assert_equal iseq.eval, [1,2,3,4]
+  ensure
+    Object.send(:remove_const, :RACTOR_CONST) if Object.const_defined?(:RACTOR_CONST)
+  end
+
+  def assert_ractor_constant_array_opt(inner_ary_code, ary_size)
+    iseq = RubyVM::InstructionSequence.compile(<<RUBY)
+      # shareable_constant_value: literal
+      RACTOR_CONST = [#{inner_ary_code}]
+RUBY
+    ary = iseq.eval
+    assert Ractor.shareable?(ary), "should be shareable"
+    assert_equal ary_size, ary.size
+    putobj_num = iseq.disasm.lines.select { |line| line =~ /putobject/ }.size
+    assert putobj_num > 0
+    assert putobj_num < 10
+  ensure
+    Object.send(:remove_const, :RACTOR_CONST) if Object.const_defined?(:RACTOR_CONST)
+  end
+
+  # (non-lit lit-opt)+
+  def test_ractor_constant_array_non_lit_then_lit_opt_plus
+    code = Array.new(512) { |index|
+      index % 128 == 0 ? "\"\#{nil}\"" : "1" # non-lit here is DSTR: "#{nil}"
+    }.join(", ")
+    assert_ractor_constant_array_opt code, 512
+  end
+
+  # (non-lit lit-opt)+ non-lit
+  def test_ractor_constant_array_non_lit_then_lit_opt_then_non_lit
+    code = Array.new(512) { |index|
+        index % 128 == 0 ? "Object.new.freeze" : "1"
+    }.join(", ") + ", Object.new.freeze"
+    assert_ractor_constant_array_opt code, 513
+  end
+
+  # non-lit lit-opt
+  def test_ractor_constant_array_non_lit_then_lit_opt
+    code = "Object.new.freeze, " + Array.new(512) { "1" }.join(", ")
+    assert_ractor_constant_array_opt code, 513
+  end
+
+  # lit-opt non-lit
+  def test_ractor_constant_array_lit_opt_then_non_lit
+    code = Array.new(512) { "1" }.join(", ") + ", Object.new.freeze"
+    assert_ractor_constant_array_opt code, 513
+  end
+
+  # (lit-opt non-lit)+ lit-opt
+  def test_ractor_constant_lit_opt_then_non_lit_plus_then_lit_opt
+    code = Array.new(512) { "1" }.join(", ") +
+      ",Object.new.freeze," + Array.new(512) { "1" }.join(", ")
+    assert_ractor_constant_array_opt code, 1025
+  end
+
   def test_disasm_encoding
     src = +"\u{3042} = 1; \u{3042}; \u{3043}"
     asm = compile(src).disasm

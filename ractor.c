@@ -1985,14 +1985,12 @@ vm_insert_ractor(rb_vm_t *vm, rb_ractor_t *r)
     VM_ASSERT(ractor_status_p(r, ractor_created));
 
     if (rb_multi_ractor_p()) {
-        rb_native_mutex_lock(&vm->ractor.sched.lock);
         RB_VM_LOCK();
         {
             vm_insert_ractor0(vm, r, false);
             vm_ractor_blocking_cnt_inc(vm, r, __FILE__, __LINE__);
         }
         RB_VM_UNLOCK();
-        rb_native_mutex_unlock(&vm->ractor.sched.lock);
     }
     else {
         if (vm->ractor.cnt == 0) {
@@ -2003,7 +2001,6 @@ vm_insert_ractor(rb_vm_t *vm, rb_ractor_t *r)
         }
         else {
             cancel_single_ractor_mode();
-            rb_native_mutex_lock(&vm->ractor.sched.lock);
             RB_VM_LOCK();
             {
                 debug_threads(stderr, "cancelled single ractor mode\n");
@@ -2011,7 +2008,6 @@ vm_insert_ractor(rb_vm_t *vm, rb_ractor_t *r)
                 vm_ractor_blocking_cnt_inc(vm, r, __FILE__, __LINE__);
             }
             RB_VM_UNLOCK();
-            rb_native_mutex_unlock(&vm->ractor.sched.lock);
         }
     }
 }
@@ -2536,7 +2532,8 @@ rb_ractor_terminate_all(void)
         while (vm->ractor.cnt > 1) {
             RUBY_DEBUG_LOG("terminate_waiting:%d", vm->ractor.sync.terminate_waiting);
             vm->ractor.sync.terminate_waiting = true;
-            rb_native_cond_broadcast(&vm->ractor.sched.cond);
+            // Luke: This might be needed for ractors!
+            /*rb_native_cond_broadcast(&vm->ractor.sched.cond);*/
 
             // wait for 1sec
             rb_vm_ractor_blocking_cnt_inc(vm, cr, __FILE__, __LINE__);

@@ -118,6 +118,7 @@ get_native_thread_id(void)
 
 #if DEBUG_THREADS
     void debug_threads(FILE *f, const char *fmt, ...) {
+        return;
         rb_vm_t *vm = GET_VM();
         rb_native_mutex_lock(&vm->debug_print_lock);
         va_list ap;
@@ -385,6 +386,9 @@ static void timer_thread_wakeup_force(void);
 static void thread_sched_switch(rb_thread_t *cth, rb_thread_t *next_th);
 static void coroutine_transfer0(struct coroutine_context *transfer_from,
                                 struct coroutine_context *transfer_to, bool to_dead);
+static void coroutine_transfer_thread(struct coroutine_context *transfer_from,
+                                      struct coroutine_context *transfer_to, rb_thread_t *thread, struct rb_native_thread *nt,
+                                      bool to_dead);
 
 #define thread_sched_dump(s) thread_sched_dump_(__FILE__, __LINE__, s)
 
@@ -451,7 +455,9 @@ thread_sched_unlock_(struct rb_thread_sched *sched, rb_thread_t *th, const char 
     RUBY_DEBUG_LOG2(file, line, "th:%u", rb_th_serial(th));
 
 #if VM_CHECK_MODE
-    VM_ASSERT(sched->lock_owner == th);
+    if (th) {
+        VM_ASSERT(sched->lock_owner == th);
+    }
     sched->lock_owner = NULL;
 #endif
 
@@ -759,7 +765,7 @@ rb_del_running_thread(rb_thread_t *th)
 }
 
 // NOTE:
-//   sched not NOT have to be current ractor's sched
+//   sched does NOT have to be current ractor's sched
 //   th can be NULL
 // setup current or next running thread
 // sched->running should be set only on this function.
@@ -833,6 +839,7 @@ thread_sched_enq(struct rb_thread_sched *sched, rb_thread_t *ready_th)
 
     VM_ASSERT(ready_th != NULL);
     VM_ASSERT(sched->running != NULL);
+    VM_ASSERT(TH_SCHED(ready_th) == sched);
     VM_ASSERT(!thread_sched_readyq_contain_p(sched, ready_th));
 
     if (sched->is_running) {
@@ -844,14 +851,9 @@ thread_sched_enq(struct rb_thread_sched *sched, rb_thread_t *ready_th)
             debug_threads(stderr, "thread_sched_enq: empty sched->readyq\n");
             // add sched->running to timeslice
             thread_sched_setup_running_threads(sched, ready_th->ractor, ready_th->vm, NULL, NULL, sched->running);
-            ractor_sched_lock(ready_th->vm, ready_th->ractor);
-            ccan_list_add_tail(&sched->readyq, &ready_th->sched.node.readyq);
-            sched->readyq_cnt++;
-            ractor_sched_unlock(ready_th->vm, ready_th->ractor);
         } else {
             // Luke: I'm not sure when this would happen so I added an assert(0)
             debug_threads(stderr, "thread_sched_enq: NON-EMPTY sched->readyq ???\n");
-            VM_ASSERT(0);
         }
     }
     else {
@@ -860,6 +862,11 @@ thread_sched_enq(struct rb_thread_sched *sched, rb_thread_t *ready_th)
         VM_ASSERT(!ractor_sched_timeslice_threads_contain_p(ready_th->vm, sched->running));
     }
 
+    // Luke: Not sure if ractor_sched_lock is needed here, I don't think it is!
+    /*ractor_sched_lock(ready_th->vm, ready_th->ractor);*/
+    ccan_list_add_tail(&sched->readyq, &ready_th->sched.node.readyq);
+    sched->readyq_cnt++;
+    /*ractor_sched_unlock(ready_th->vm, ready_th->ractor);*/
 }
 
 static void
@@ -870,8 +877,9 @@ thread_sched_wait_running_turn(struct rb_thread_sched *sched, rb_thread_t *th, b
  * and how we would then wake them back up.
  *
  * Preconditions:
+ *   sched is locked
  *   sched->running == next_th
- * NOTE:
+ * Arguments:
  *   next_th can be NULL
  *   next_th does NOT have to be thread of current ractor
  */
@@ -890,7 +898,10 @@ thread_sched_wakeup_running_thread(struct rb_thread_sched *sched, rb_thread_t *p
                 debug_threads(stderr, "thread_sched_wakeup_running_thread: next_th:%d, next_th->nt, signalling nt:%d\n",
                     next_th->serial, next_th->nt->serial
                 );
-                rb_native_cond_signal(&next_th->nt->cond.readyq);
+                rb_thread_t *owner = sched->lock_owner;
+                /*thread_sched_unlock(sched, NULL);*/
+                rb_native_cond_signal(&next_th->nt->cond.readyq); // give the thread a chance to run by unlocking the sched first
+                /*thread_sched_lock(sched, owner);*/
             }
             else {
                 // TODO
@@ -932,6 +943,7 @@ thread_sched_wakeup_running_thread(struct rb_thread_sched *sched, rb_thread_t *p
                 debug_threads(stderr, "thread_sched_wakeup_running_thread: next_th:%d, !will_switch, ractor_sched_enq\n",
                     next_th->serial
                 );
+                // Luke: I added this to make ractors work
                 ractor_sched_enq(next_th->vm, next_th->ractor, false);
             }
         }
@@ -963,9 +975,10 @@ thread_sched_to_ready_common(struct rb_thread_sched *sched, rb_thread_t *th, boo
     VM_ASSERT(sched->running != th);
     VM_ASSERT(!thread_sched_readyq_contain_p(sched, th));
     RB_INTERNAL_THREAD_HOOK(RUBY_INTERNAL_THREAD_EVENT_READY, th);
-    if (th->ractor != GET_RACTOR()) {
-        will_switch = false;
-    }
+    // Luke: I think this is needed for Ractors!
+    /*if (th->ractor != GET_RACTOR()) {*/
+        /*will_switch = false;*/
+    /*}*/
 
     if (sched->running == NULL) {
         debug_threads(stderr, "thread_sched_to_ready_common th:%d sched->running == NULL, wakeup:%d, will_switch:%d\n",
@@ -995,7 +1008,6 @@ thread_sched_to_ready_common(struct rb_thread_sched *sched, rb_thread_t *th, boo
         }
     }
     else {
-        VM_ASSERT(th);
         debug_threads(stderr, "thread_sched_to_ready_common th:%d sched->running != NULL, wakeup:%d, will_switch:%d\n", th->serial, wakeup, will_switch);
         thread_sched_enq(sched, th);
     }
@@ -1023,9 +1035,8 @@ thread_sched_to_ready(struct rb_thread_sched *sched, rb_thread_t *th)
 }
 
 // Preconditions:
-//   sched is locked
+//   sched(th) is locked
 //
-// TODO: LUKE: put debug_threads calls in this function!
 // wait until sched->running is `th`.
 static void
 thread_sched_wait_running_turn(struct rb_thread_sched *sched, rb_thread_t *th, bool can_direct_transfer)
@@ -1045,8 +1056,8 @@ thread_sched_wait_running_turn(struct rb_thread_sched *sched, rb_thread_t *th, b
             if (th_has_dedicated_nt(th)) {
                 RUBY_DEBUG_LOG("(nt) sleep th:%u running:%u", rb_th_serial(th), rb_th_serial(sched->running));
 
-                debug_threads(stderr, "thread_sched_wait_running_turn: r:%d th:%d dedicated nt:%d cond_wait before\n",
-                    rb_ractor_id(th->ractor), th->serial, th->nt->serial
+                debug_threads(stderr, "thread_sched_wait_running_turn: r:%d th:%d next_th:%d dnt:%d cond_wait before\n",
+                    rb_ractor_id(th->ractor), th->serial, next_th ? next_th->serial : -1, th->nt->serial
                 );
                 thread_sched_set_lock_owner(sched, NULL);
                 {
@@ -1054,9 +1065,9 @@ thread_sched_wait_running_turn(struct rb_thread_sched *sched, rb_thread_t *th, b
                     rb_native_cond_wait(&th->nt->cond.readyq, &sched->lock_);
                 }
                 thread_sched_set_lock_owner(sched, th);
-                debug_threads(stderr, "thread_sched_wait_running_turn: r:%d th:%d dedicated nt:%d cond_wait after (wakeup)\n",
-                    rb_ractor_id(th->ractor), th->serial, th->nt->serial
-                );
+                debug_threads(stderr, "thread_sched_wait_running_turn: r:%d th:%d dedicated nt:%d cond_wait after (wakeup, success:%d)\n",
+                              rb_ractor_id(th->ractor), th->serial, th->nt->serial, sched->running == th ? 1 : 0
+                              );
 
                 RUBY_DEBUG_LOG("(nt) wakeup %s", sched->running == th ? "success" : "failed");
                 if (th == sched->running) {
@@ -1076,12 +1087,16 @@ thread_sched_wait_running_turn(struct rb_thread_sched *sched, rb_thread_t *th, b
                     thread_sched_set_lock_owner(sched, NULL);
                     {
                         rb_ractor_set_current_ec(th->ractor, NULL);
-                        debug_threads(stderr, "thread_sched_wait_running_turn: can_direct_transfer from to:%d to next_th:%d\n",
+                        debug_threads(stderr, "thread_sched_wait_running_turn: can_direct_transfer (thread_sched_switch) from to:%d to next_th:%d\n",
                             th->serial, next_th->serial
                         );
                         // NOTE: coroutine_transfer WITH thread sched lock
                         thread_sched_switch(th, next_th);
                     }
+                    debug_threads(stderr,
+                        "thread_sched_wait_running_turn: can_direct_transfer from to:%d to next_th:%d, AFTER transfer\n",
+                        th->serial, next_th->serial
+                    );
                     thread_sched_set_lock_owner(sched, th);
                 }
                 else {
@@ -1102,15 +1117,20 @@ thread_sched_wait_running_turn(struct rb_thread_sched *sched, rb_thread_t *th, b
                     {
                         rb_ractor_set_current_ec(th->ractor, NULL);
                         debug_threads(stderr,
-                            "thread_sched_wait_running_turn r:%d th:%d calling coroutine_transfer0\n",
+                            "thread_sched_wait_running_turn r:%d th:%d calling coroutine_transfer_thread\n",
                             rb_ractor_id(th->ractor),
                             th->serial
                         );
                         // Jumps back to ractor_sched_deq() loop in nt_start
                         // NOTE: coroutine_transfer WITH thread sched lock
-                        coroutine_transfer0(th->sched.context, nt->nt_context, false);
+                        coroutine_transfer_thread(th->sched.context, nt->nt_context, th, nt, false);
                     }
                     thread_sched_set_lock_owner(sched, th);
+                    debug_threads(stderr,
+                        "thread_sched_wait_running_turn r:%d th:%d coroutine_transfer_thread AFTER\n",
+                        rb_ractor_id(th->ractor),
+                        th->serial
+                    );
                 }
 
                 VM_ASSERT(rb_current_ec_noinline() == th->ec);
@@ -1248,9 +1268,10 @@ thread_sched_to_waiting_common0(struct rb_thread_sched *sched, rb_thread_t *th, 
 
     RUBY_DEBUG_LOG("%sth:%u", to_dead ? "to_dead " : "", rb_th_serial(th));
     bool can_switch = to_dead ? !th_has_dedicated_nt(th) : false;
-    if (can_switch && th->ractor != GET_RACTOR()) {
-        can_switch = false;
-    }
+    // Luke: I think this is needed!
+    /*if (can_switch && th->ractor != GET_RACTOR()) {*/
+        /*can_switch = false;*/
+    /*}*/
 
     debug_threads(stderr, "thread_sched_to_waiting_common0 th:%d can_switch:%d\n", th->serial, can_switch);
     thread_sched_wakeup_next_thread(sched, th, can_switch);
@@ -1423,6 +1444,19 @@ rb_thread_sched_init(struct rb_thread_sched *sched, bool atfork)
 }
 
 static void
+coroutine_transfer_thread(struct coroutine_context *transfer_from, struct coroutine_context *transfer_to,
+                          rb_thread_t *th, struct rb_native_thread *nt, bool to_dead)
+{
+    debug_threads(stderr, "coroutine_transfer_thread before r:%d nt:%d th:%d\n",
+        rb_ractor_id(th->ractor), nt->serial, th->serial
+    );
+    coroutine_transfer0(transfer_from, transfer_to, to_dead);
+    debug_threads(stderr, "coroutine_transfer_thread after r:%d nt:%d th:%d\n",
+        rb_ractor_id(th->ractor), nt->serial, th->serial
+    );
+}
+
+static void
 coroutine_transfer0(struct coroutine_context *transfer_from, struct coroutine_context *transfer_to, bool to_dead)
 {
 #ifdef RUBY_ASAN_ENABLED
@@ -1447,8 +1481,9 @@ coroutine_transfer0(struct coroutine_context *transfer_from, struct coroutine_co
 //   nt != NULL
 //   next_th != NULL
 // Preconditions:
+//   sched is locked
+//   nt->dedicated == 0
 //   next_th->nt == NULL
-//   sched is locked. Why?
 // run `next_th` on the given native thread
 static void
 thread_sched_switch0(struct coroutine_context *current_cont, rb_thread_t *next_th, struct rb_native_thread *nt, bool to_dead)
@@ -1461,7 +1496,7 @@ thread_sched_switch0(struct coroutine_context *current_cont, rb_thread_t *next_t
     ruby_thread_set_native(next_th);
     native_thread_assign(nt, next_th);
 
-    coroutine_transfer0(current_cont, next_th->sched.context, to_dead);
+    coroutine_transfer_thread(current_cont, next_th->sched.context, next_th, nt, to_dead);
 }
 
 // Arguments:
@@ -1476,8 +1511,8 @@ thread_sched_switch(rb_thread_t *cth, rb_thread_t *next_th)
     struct rb_native_thread *nt = cth->nt;
     native_thread_assign(NULL, cth);
     RUBY_DEBUG_LOG("th:%u->%u on nt:%d", rb_th_serial(cth), rb_th_serial(next_th), nt->serial);
-    debug_threads(stderr, "thread_sched_switch nt:%d from_th:%d, to_th:%d\n",
-        nt->serial, cth->serial, next_th->serial
+    debug_threads(stderr, "thread_sched_switch nt:%d from_th:%d, to_th:%d (to_dead:%d)\n",
+        nt->serial, cth->serial, next_th->serial, cth->status == THREAD_KILLED
     );
     thread_sched_switch0(cth->sched.context, next_th, nt, cth->status == THREAD_KILLED);
 }
@@ -2557,7 +2592,7 @@ nt_start(void *ptr)
 
             // start threads
             debug_threads(stderr, "nt_start nt->dedicated nt:%d, running_thread:%d, call_thread_start_func_2\n", nt->serial, th->serial);
-            call_thread_start_func_2(th);
+            call_thread_start_func_2(th); // sched->running == th
             break; // TODO: allow to change to the SNT
         }
         else {
@@ -2573,7 +2608,9 @@ nt_start(void *ptr)
 
                     if (next_th && next_th->nt == NULL) {
                         RUBY_DEBUG_LOG("nt:%d next_th:%d", (int)nt->serial, (int)next_th->serial);
-                        debug_threads(stderr, "snt %d picked up ractor %d, will run th %d\n", nt->serial, rb_ractor_id(r), next_th->serial);
+                        debug_threads(stderr, "snt %d picked up ractor %d, will run th %d (%s)\n",
+                            nt->serial, rb_ractor_id(r), next_th->serial, thread_status_name(next_th, true)
+                        );
                         thread_sched_switch0(nt->nt_context, next_th, nt, false);
                     }
                     else {
@@ -3184,7 +3221,6 @@ timer_thread_set_timeout(rb_vm_t *vm)
 #else
     int timeout = -1;
 
-    bool wait_inf = false;
     ractor_sched_lock(vm, NULL);
     {
         if (   !ccan_list_empty(&vm->ractor.sched.timeslice_threads) // (1-1) Provide time slice for active NTs
@@ -3199,16 +3235,14 @@ timer_thread_set_timeout(rb_vm_t *vm)
 
             timeout = 10; // ms
             vm->ractor.sched.timeslice_wait_inf = false;
-            wait_inf = false;
         }
         else {
-            vm->ractor.sched.timeslice_wait_inf = false;
-            wait_inf = false;
+            vm->ractor.sched.timeslice_wait_inf = true;
         }
     }
     ractor_sched_unlock(vm, NULL);
 
-    if (wait_inf) {
+    if (vm->ractor.sched.timeslice_wait_inf) {
         rb_native_mutex_lock(&timer_th.waiting_lock);
         {
             struct rb_thread_sched_waiting *w = ccan_list_top(&timer_th.waiting, struct rb_thread_sched_waiting, node);
@@ -3227,7 +3261,7 @@ timer_thread_set_timeout(rb_vm_t *vm)
         rb_native_mutex_unlock(&timer_th.waiting_lock);
     }
 
-    RUBY_DEBUG_LOG("timeout:%d inf:%d", timeout, wait_inf);
+    RUBY_DEBUG_LOG("timeout:%d inf:%d", timeout, (int)vm->ractor.sched.timeslice_wait_inf);
 
     // fprintf(stderr, "timeout:%d\n", timeout);
     debug_threads(stderr, "Timer thread timeout in seconds: %d\n", timeout);

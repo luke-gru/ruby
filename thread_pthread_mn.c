@@ -462,7 +462,7 @@ co_start(struct coroutine_context *from, struct coroutine_context *self)
     // RUBY_DEBUG_LOG("th:%u", rb_th_serial(th));
 
     thread_sched_set_lock_owner(sched, th);
-    thread_sched_add_running_thread(TH_SCHED(th), th);
+    thread_sched_add_running_thread(sched, th);
     thread_sched_unlock(sched, th);
     {
         debug_threads(stderr, "co_start th:%d RESUMED\n", th->serial);
@@ -502,7 +502,7 @@ co_start(struct coroutine_context *from, struct coroutine_context *self)
         }
         else {
             if (next_th && !next_th->nt) {
-                debug_threads(stderr, "co_start after call_thread_start_func_2 for th:%d, no next_th, switching to next ractor, but ENQ first!!!!!!\n", th->serial);
+                debug_threads(stderr, "co_start after call_thread_start_func_2 for th:%d, no next_th, switching to next ractor, but ENQ first!!!\n", th->serial);
                 ractor_sched_enq(next_th->vm, next_th->ractor, true);
             } else {
                 debug_threads(stderr, "co_start after call_thread_start_func_2 for th:%d, no next_th, switching to next ractor\n", th->serial);

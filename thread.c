@@ -451,6 +451,9 @@ rb_threadptr_unlock_all_locking_mutexes(rb_thread_t *th)
     }
 }
 
+// terminate all non-main threads for a ractor
+// Arguments:
+//   th == th->ractor->threads.main
 void
 rb_thread_terminate_all(rb_thread_t *th)
 {
@@ -463,7 +466,9 @@ rb_thread_terminate_all(rb_thread_t *th)
                (void *)cr->threads.main, (void *)th);
     }
 
-    debug_threads(stderr, "rb_thread_terminate_all\n");
+    debug_threads(stderr, "rb_thread_terminate_all (all non-main threads) r:%d th:%d\n",
+        rb_ractor_id(th->ractor), th->serial
+    );
     /* unlock all locking mutexes */
     rb_threadptr_unlock_all_locking_mutexes(th);
 
@@ -653,28 +658,30 @@ thread_do_start(rb_thread_t *th)
 
 void rb_ec_clear_current_thread_trace_func(const rb_execution_context_t *ec);
 
-// start a new ractor
+// run a thread on a native thread
 static int
 thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
 {
     RUBY_DEBUG_LOG("th:%u", rb_th_serial(th));
     VM_ASSERT(th != th->vm->ractor.main_thread);
 
-    debug_threads(stderr, "thread_start_func_2 (new ractor): r:%d th:%d\n",
-        rb_ractor_id(th->ractor), th->serial
+    VM_ASSERT(TH_SCHED(th)->running == th);
+    debug_threads(stderr, "thread_start_func_2 (new ractor): r:%d th:%d TH_SCHED(th)->running:%p, th:%p\n",
+        rb_ractor_id(th->ractor), th->serial, TH_SCHED(th)->running, th
     );
 
     enum ruby_tag_type state;
     VALUE errinfo = Qnil;
     rb_thread_t *ractor_main_th = th->ractor->threads.main;
 
-    // setup ractor
     if (rb_ractor_status_p(th->ractor, ractor_blocking)) {
+        debug_threads(stderr, "thread_start_func_2: r:%d (blocking, dec) th:%d\n",
+            rb_ractor_id(th->ractor), th->serial
+        );
+        VM_ASSERT(GET_RACTOR() == th->ractor);
+        // Luke: Figure out why this is blocking forever sometimes
         RB_VM_LOCK();
         {
-            debug_threads(stderr, "thread_start_func_2: r:%d (blocking, dec) th:%d\n",
-                rb_ractor_id(th->ractor), th->serial
-            );
             rb_vm_ractor_blocking_cnt_dec(th->vm, th->ractor, __FILE__, __LINE__);
             rb_ractor_t *r = th->ractor;
             r->r_stdin = rb_io_prep_stdin();
@@ -694,6 +701,9 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
 
     if ((state = EC_EXEC_TAG()) == TAG_NONE) {
         EXEC_EVENT_HOOK(th->ec, RUBY_EVENT_THREAD_BEGIN, th->self, 0, 0, 0, Qundef);
+        debug_threads(stderr, "thread_start_func_2: r:%d th:%d, calling thread_do_start\n",
+            rb_ractor_id(th->ractor), th->serial
+        );
 
         result = thread_do_start(th);
     }
@@ -804,9 +814,9 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
         rb_ractor_living_threads_remove(th->ractor, th);
     }
     else {
-        // Luke: Not sure of the order of these. They were the opposite of above order
-        thread_sched_to_dead(TH_SCHED(th), th);
+        // Luke: Not sure of the order of these. They are opposite of above!
         rb_ractor_living_threads_remove(th->ractor, th);
+        thread_sched_to_dead(TH_SCHED(th), th);
     }
 
     return 0;

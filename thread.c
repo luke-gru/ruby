@@ -200,9 +200,11 @@ static inline void blocking_region_end(rb_thread_t *th, struct rb_blocking_regio
         /* Important that this is inlined into the macro, and not part of \
          * blocking_region_begin - see bug #20493 */ \
         RB_VM_SAVE_MACHINE_CONTEXT(th); \
+        debug_threads(stderr, "blocking_region_begin th:%d\n", th->serial); \
         thread_sched_to_waiting(TH_SCHED(th), th); \
         exec; \
         blocking_region_end(th, &__region); \
+        debug_threads(stderr, "blocking_region_end th:%d\n", th->serial); \
     }; \
 } while(0)
 
@@ -461,6 +463,7 @@ rb_thread_terminate_all(rb_thread_t *th)
                (void *)cr->threads.main, (void *)th);
     }
 
+    debug_threads(stderr, "rb_thread_terminate_all\n");
     /* unlock all locking mutexes */
     rb_threadptr_unlock_all_locking_mutexes(th);
 
@@ -478,7 +481,9 @@ rb_thread_terminate_all(rb_thread_t *th)
              * me when the last sub-thread exit.
              */
             sleeping = 1;
+            debug_threads(stderr, "rb_thread_terminate_all native_sleep with timeout before\n");
             native_sleep(th, &rel);
+            debug_threads(stderr, "rb_thread_terminate_all native_sleep with timeout after\n");
             RUBY_VM_CHECK_INTS_BLOCKING(ec);
             sleeping = 0;
         }
@@ -584,6 +589,7 @@ thread_do_start_proc(rb_thread_t *th)
         rb_ractor_receive_parameters(th->ec, th->ractor, args_len, (VALUE *)args_ptr);
         vm_check_ints_blocking(th->ec);
 
+        debug_threads(stderr, "thread_do_start_proc r:%d th:%d type ractor_proc\n", rb_ractor_id(th->ractor), th->serial);
         return rb_vm_invoke_proc_with_self(
             th->ec, proc, self,
             args_len, args_ptr,
@@ -605,6 +611,7 @@ thread_do_start_proc(rb_thread_t *th)
 
         vm_check_ints_blocking(th->ec);
 
+        debug_threads(stderr, "thread_do_start_proc r:%d th:%d type type_proc\n", rb_ractor_id(th->ractor), th->serial);
         return rb_vm_invoke_proc(
             th->ec, proc,
             args_len, args_ptr,
@@ -622,15 +629,18 @@ thread_do_start(rb_thread_t *th)
 
     switch (th->invoke_type) {
       case thread_invoke_type_proc:
+        debug_threads(stderr, "thread_do_start type_proc th:%d\n", th->serial);
         result = thread_do_start_proc(th);
         break;
 
       case thread_invoke_type_ractor_proc:
+        debug_threads(stderr, "thread_do_start type_ractor_proc th:%d\n", th->serial);
         result = thread_do_start_proc(th);
         rb_ractor_atexit(th->ec, result);
         break;
 
       case thread_invoke_type_func:
+        debug_threads(stderr, "thread_do_start type_func th:%d\n", th->serial);
         result = (*th->invoke_arg.func.func)(th->invoke_arg.func.arg);
         break;
 
@@ -643,11 +653,16 @@ thread_do_start(rb_thread_t *th)
 
 void rb_ec_clear_current_thread_trace_func(const rb_execution_context_t *ec);
 
+// start a new ractor
 static int
 thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
 {
     RUBY_DEBUG_LOG("th:%u", rb_th_serial(th));
     VM_ASSERT(th != th->vm->ractor.main_thread);
+
+    debug_threads(stderr, "thread_start_func_2 (new ractor): r:%d th:%d\n",
+        rb_ractor_id(th->ractor), th->serial
+    );
 
     enum ruby_tag_type state;
     VALUE errinfo = Qnil;
@@ -657,6 +672,9 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
     if (rb_ractor_status_p(th->ractor, ractor_blocking)) {
         RB_VM_LOCK();
         {
+            debug_threads(stderr, "thread_start_func_2: r:%d (blocking, dec) th:%d\n",
+                rb_ractor_id(th->ractor), th->serial
+            );
             rb_vm_ractor_blocking_cnt_dec(th->vm, th->ractor, __FILE__, __LINE__);
             rb_ractor_t *r = th->ractor;
             r->r_stdin = rb_io_prep_stdin();
@@ -685,6 +703,7 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
         rb_fiber_scheduler_set(Qnil);
     }
 
+    debug_threads(stderr, "thread_start_func2: th:%d thread ended\n", th->serial);
     if (!event_thread_end_hooked) {
         event_thread_end_hooked = 1;
         EXEC_EVENT_HOOK(th->ec, RUBY_EVENT_THREAD_END, th->self, 0, 0, 0, Qundef);
@@ -785,8 +804,9 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
         rb_ractor_living_threads_remove(th->ractor, th);
     }
     else {
-        rb_ractor_living_threads_remove(th->ractor, th);
+        // Luke: Not sure of the order of these. They were the opposite of above order
         thread_sched_to_dead(TH_SCHED(th), th);
+        rb_ractor_living_threads_remove(th->ractor, th);
     }
 
     return 0;
@@ -867,7 +887,17 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
 
     RUBY_DEBUG_LOG("r:%u th:%u", rb_ractor_id(th->ractor), rb_th_serial(th));
 
-    rb_ractor_living_threads_insert(th->ractor, th);
+    rb_ractor_living_threads_insert(th->ractor, th); // locks ractor lock, bumps r->threads.cnt, adds thread to r->threads.set
+    //
+#ifdef RUBY_NT_SERIAL_MINE
+    static int th_serial = 2;
+    RB_VM_LOCK_ENTER();
+    {
+        th->serial = th_serial;
+        th_serial++;
+    }
+    RB_VM_LOCK_LEAVE();
+#endif
 
     /* kick thread */
     err = native_thread_create(th);
@@ -1063,6 +1093,7 @@ thread_join_sleep(VALUE arg)
             else return Qfalse;
         }
         else if (!limit) {
+            debug_threads(stderr, "thread_join_sleep: th:%d waiting for th:%d\n", th->serial, target_th->serial);
             sleep_forever(th, SLEEP_DEADLOCKABLE | SLEEP_ALLOW_SPURIOUS | SLEEP_NO_CHECKINTS);
         }
         else {
@@ -1071,6 +1102,7 @@ thread_join_sleep(VALUE arg)
                 return Qfalse;
             }
             th->status = THREAD_STOPPED;
+            debug_threads(stderr, "thread_join_sleep: th:%d waiting for th:%d with limit\n", th->serial, target_th->serial);
             native_sleep(th, limit);
         }
         RUBY_VM_CHECK_INTS_BLOCKING(th->ec);
@@ -1306,6 +1338,7 @@ sleep_hrtime(rb_thread_t *th, rb_hrtime_t rel, unsigned int fl)
     th->status = THREAD_STOPPED;
     RUBY_VM_CHECK_INTS_BLOCKING(th->ec);
     while (th->status == THREAD_STOPPED) {
+        debug_threads(stderr, "sleep_hrtime calling native_sleep for th:%d\n", th->serial);
         native_sleep(th, &rel);
         woke = vm_check_ints_blocking(th->ec);
         if (woke && !(fl & SLEEP_SPURIOUS_CHECK))
@@ -1328,6 +1361,7 @@ sleep_hrtime_until(rb_thread_t *th, rb_hrtime_t end, unsigned int fl)
     th->status = THREAD_STOPPED;
     RUBY_VM_CHECK_INTS_BLOCKING(th->ec);
     while (th->status == THREAD_STOPPED) {
+        debug_threads(stderr, "sleep_hrtime_until calling native_sleep for th:%d\n", th->serial);
         native_sleep(th, &rel);
         woke = vm_check_ints_blocking(th->ec);
         if (woke && !(fl & SLEEP_SPURIOUS_CHECK))
@@ -1358,6 +1392,7 @@ sleep_forever(rb_thread_t *th, unsigned int fl)
             rb_check_deadlock(th->ractor);
         }
         {
+            debug_threads(stderr, "sleep_forever calling native_sleep for th:%d\n", th->serial);
             native_sleep(th, 0);
         }
         if (fl & SLEEP_DEADLOCKABLE) {
@@ -1413,6 +1448,7 @@ rb_thread_wait_for(struct timeval time)
 {
     rb_thread_t *th = GET_THREAD();
 
+    debug_threads(stderr, "rb_thread_wait_for th:%d\n", th->serial);
     sleep_hrtime(th, rb_timeval2hrtime(&time), SLEEP_SPURIOUS_CHECK);
 }
 
@@ -1455,6 +1491,7 @@ rb_thread_interrupted(VALUE thval)
 void
 rb_thread_sleep(int sec)
 {
+    debug_threads(stderr, "rb_thread_sleep th:%d\n", GET_THREAD()->serial);
     rb_thread_wait_for(rb_time_timeval(INT2FIX(sec)));
 }
 
@@ -1702,6 +1739,7 @@ thread_io_setup_wfd(rb_thread_t *th, int fd, struct waiting_fd *wfd)
 
     RB_VM_LOCK_ENTER();
     {
+        debug_threads(stderr, "thread_io_setup_wfd th:%d\n", th->serial);
         ccan_list_add(&th->vm->waiting_fds, &wfd->wfd_node);
     }
     RB_VM_LOCK_LEAVE();
@@ -1711,7 +1749,9 @@ static void
 thread_io_wake_pending_closer(struct waiting_fd *wfd)
 {
     bool has_waiter = wfd->busy && RB_TEST(wfd->busy->wakeup_mutex);
+    debug_threads(stderr, "thread_io_wake_pending_closer begin\n");
     if (has_waiter) {
+        debug_threads(stderr, "thread_io_wake_pending_closer LOCK\n");
         rb_mutex_lock(wfd->busy->wakeup_mutex);
     }
 
@@ -1724,6 +1764,7 @@ thread_io_wake_pending_closer(struct waiting_fd *wfd)
 
     if (has_waiter) {
         rb_thread_t *th = rb_thread_ptr(wfd->busy->closing_thread);
+        debug_threads(stderr, "thread_io_wake_pending_closer th:%d\n", th->serial);
         if (th->scheduler != Qnil) {
             rb_fiber_scheduler_unblock(th->scheduler, wfd->busy->closing_thread, wfd->busy->closing_fiber);
         } else {
@@ -1731,6 +1772,7 @@ thread_io_wake_pending_closer(struct waiting_fd *wfd)
         }
         rb_mutex_unlock(wfd->busy->wakeup_mutex);
     }
+    debug_threads(stderr, "thread_io_wake_pending_closer end\n");
 }
 
 static bool
@@ -1862,6 +1904,7 @@ rb_thread_io_blocking_call(rb_blocking_function_t *func, void *data1, int fd, in
 
     errno = saved_errno;
 
+    debug_threads(stderr, "rb_thread_io_blocking_call end th:%d\n", th->serial);
     return val;
 }
 
@@ -2695,6 +2738,7 @@ rb_notify_fd_close_wait(struct rb_io_close_wait_list *busy)
         return;
     }
 
+    debug_threads(stderr, "rb_notify_fd_close_wait\n");
     rb_mutex_lock(busy->wakeup_mutex);
     while (!ccan_list_empty(&busy->pending_fd_users)) {
         rb_mutex_sleep(busy->wakeup_mutex, Qnil);
@@ -3516,6 +3560,13 @@ rb_thread_native_thread_id(VALUE thread)
 #else
 # define rb_thread_native_thread_id rb_f_notimplement
 #endif
+
+static VALUE
+rb_thread_serial(VALUE thread)
+{
+    rb_thread_t *th = rb_thread_ptr(thread);
+    return INT2NUM(th->serial);
+}
 
 /*
  * call-seq:
@@ -4349,6 +4400,7 @@ rb_thread_fd_select(int max, rb_fdset_t * read, rb_fdset_t * write, rb_fdset_t *
             rb_thread_sleep_forever();
             return 0;
         }
+        debug_threads(stderr, "rb_thread_fd_select th:%d\n", set.th->serial);
         rb_thread_wait_for(*timeout);
         return 0;
     }
@@ -5493,6 +5545,7 @@ Init_Thread(void)
     rb_define_method(rb_cThread, "name", rb_thread_getname, 0);
     rb_define_method(rb_cThread, "name=", rb_thread_setname, 1);
     rb_define_method(rb_cThread, "native_thread_id", rb_thread_native_thread_id, 0);
+    rb_define_method(rb_cThread, "serial", rb_thread_serial, 0);
     rb_define_method(rb_cThread, "to_s", rb_thread_to_s, 0);
     rb_define_alias(rb_cThread, "inspect", "to_s");
 

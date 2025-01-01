@@ -2619,12 +2619,14 @@ convert_umethod_to_method_components(const struct METHOD *data, VALUE recv, VALU
         }
         VALUE ic = rb_class_search_ancestor(klass, me->owner);
         if (ic) {
+            /*fprintf(stderr, "convert_umethod_to_method_components:module:ic_found\n");*/
             klass = ic;
             iclass = ic;
         }
         else {
             klass = rb_include_class_new(methclass, klass);
         }
+        /*fprintf(stderr, "convert_umethod_to_method_components:module\n");*/
         me = (const rb_method_entry_t *) rb_method_entry_complement_defined_class(me, me->called_id, klass);
     }
 
@@ -2713,10 +2715,12 @@ umethod_bind_call(int argc, VALUE *argv, VALUE method)
 
     const rb_callable_method_entry_t *cme = rb_callable_method_entry(CLASS_OF(recv), data->me->called_id);
     if (data->me == (const rb_method_entry_t *)cme) {
+        /*fprintf(stderr, "bind_call found cme\n");*/
         vm_passed_block_handler_set(ec, proc_to_block_handler(passed_procval));
         return rb_vm_call_kw(ec, recv, cme->called_id, argc, argv, cme, RB_PASS_CALLED_KEYWORDS);
     }
     else {
+        /*fprintf(stderr, "bind_call didn't find cme\n");*/
         VALUE methclass, klass, iclass;
         const rb_method_entry_t *me;
         convert_umethod_to_method_components(data, recv, &methclass, &klass, &iclass, &me, false);

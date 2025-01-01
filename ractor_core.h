@@ -279,12 +279,28 @@ rb_ractor_sleeper_thread_num(rb_ractor_t *r)
     return r->threads.sleeper;
 }
 
+static inline uint32_t
+rb_ractor_id(const rb_ractor_t *r)
+{
+    return r->pub.id;
+}
+
+// Arguments:
+//   GET_RACTOR() == cr
+//   th != NULL
+//   th->ractor == cr
 static inline void
 rb_ractor_thread_switch(rb_ractor_t *cr, rb_thread_t *th)
 {
+    VM_ASSERT(th->ractor == cr);
+    VM_ASSERT(th);
     RUBY_DEBUG_LOG("th:%d->%u%s",
                    cr->threads.running_ec ? (int)rb_th_serial(cr->threads.running_ec->thread_ptr) : -1,
                    rb_th_serial(th), cr->threads.running_ec == th->ec ? " (same)" : "");
+
+    debug_threads(stderr, "rb_ractor_thread_switch r:%d th:%d ec:%s\n",
+        rb_ractor_id(cr), rb_th_serial(th), cr->threads.running_ec == th->ec ? "same" : "diff"
+    );
 
     if (cr->threads.running_ec != th->ec) {
         if (0) {
@@ -326,11 +342,6 @@ rb_ractor_set_current_ec_(rb_ractor_t *cr, rb_execution_context_t *ec, const cha
 void rb_vm_ractor_blocking_cnt_inc(rb_vm_t *vm, rb_ractor_t *cr, const char *file, int line);
 void rb_vm_ractor_blocking_cnt_dec(rb_vm_t *vm, rb_ractor_t *cr, const char *file, int line);
 
-static inline uint32_t
-rb_ractor_id(const rb_ractor_t *r)
-{
-    return r->pub.id;
-}
 
 #if RACTOR_CHECK_MODE > 0
 # define RACTOR_BELONGING_ID(obj) (*(uint32_t *)(((uintptr_t)(obj)) + rb_gc_obj_slot_size(obj)))

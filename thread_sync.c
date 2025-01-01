@@ -300,6 +300,10 @@ do_mutex_lock(VALUE self, int interruptible_p)
     rb_fiber_t *fiber = ec->fiber_ptr;
     rb_mutex_t *mutex = mutex_ptr(self);
     rb_atomic_t saved_ints = 0;
+    rb_ractor_t *r = GET_RACTOR();
+    if (r && r != th->vm->ractor.main_ractor) {
+        debug_threads(stderr, "do_mutex_lock in non-main ractor th:%d\n", th->serial);
+    }
 
     /* When running trap handler */
     if (!FL_TEST_RAW(self, MUTEX_ALLOW_TRAP) &&
@@ -362,7 +366,9 @@ do_mutex_lock(VALUE self, int interruptible_p)
 
                 ccan_list_add_tail(&mutex->waitq, &sync_waiter.node);
                 {
+                    debug_threads(stderr, "do_mutex_lock native_sleep before th:%d\n", th->serial);
                     native_sleep(th, NULL);
+                    debug_threads(stderr, "do_mutex_lock native_sleep after th:%d\n", th->serial);
                 }
                 ccan_list_del(&sync_waiter.node);
 
@@ -373,7 +379,6 @@ do_mutex_lock(VALUE self, int interruptible_p)
 
                 rb_ractor_sleeper_threads_dec(th->ractor);
                 th->status = prev_status;
-                th->locking_mutex = Qfalse;
                 th->locking_mutex = Qfalse;
 
                 RUBY_DEBUG_LOG("%p wakeup", mutex);
@@ -478,6 +483,9 @@ rb_mutex_unlock_th(rb_mutex_t *mutex, rb_thread_t *th, rb_fiber_t *fiber)
               case THREAD_RUNNABLE: /* from someone else calling Thread#run */
               case THREAD_STOPPED_FOREVER: /* likely (rb_mutex_lock) */
                 RUBY_DEBUG_LOG("wakeup th:%u", rb_th_serial(cur->th));
+                debug_threads(stderr, "rb_mutex_unlock_th: wakeup r:%d th:%d nt:%d",
+                    rb_ractor_id(cur->th->ractor), cur->th->serial, cur->th->nt->serial
+                );
                 rb_threadptr_interrupt(cur->th);
                 return NULL;
               case THREAD_STOPPED: /* probably impossible */
@@ -595,6 +603,7 @@ rb_mutex_sleep(VALUE self, VALUE timeout)
         .timeout = timeout,
     };
 
+    debug_threads(stderr, "rb_mutex_sleep\n");
     VALUE woken = rb_ensure(mutex_sleep_begin, (VALUE)&arguments, mutex_lock_uninterruptible, self);
 
     RUBY_VM_CHECK_INTS_BLOCKING(GET_EC());

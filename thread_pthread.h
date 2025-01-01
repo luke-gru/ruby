@@ -42,12 +42,12 @@ struct rb_thread_sched_waiting {
     struct ccan_list_node node;
 };
 
-// per-Thead scheduler helper data
+// per-Thread scheduler helper data
 struct rb_thread_sched_item {
     struct {
         struct ccan_list_node ubf;
 
-        // connected to ractor->threads.sched.reqdyq
+        // connected to ractor->threads.sched.readyq
         // locked by ractor->threads.sched.lock
         struct ccan_list_node readyq;
 
@@ -136,6 +136,8 @@ struct rb_thread_sched {
   # ifdef __APPLE__
     // on Darwin, TLS can not be accessed across .so
     NOINLINE(struct rb_execution_context_struct *rb_current_ec(void));
+    // added by Luke
+    #define RUBY_NT_SERIAL_MINE 1
   # else
     RUBY_EXTERN RB_THREAD_LOCAL_SPECIFIER struct rb_execution_context_struct *ruby_current_ec;
 

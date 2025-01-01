@@ -515,26 +515,37 @@ rb_add_method_optimized(VALUE klass, ID mid, enum method_optimized_type opt_type
 }
 
 static void
+do_rb_method_definition_release(rb_method_definition_t *def)
+{
+    const int reference_count = def->reference_count;
+    def->reference_count--;
+
+    VM_ASSERT(reference_count >= 0);
+
+    if (def->reference_count == 0) {
+        if (METHOD_DEBUG) fprintf(stderr, "-%p-%s:%d (remove)\n", (void *)def,
+                                  rb_id2name(def->original_id), def->reference_count);
+        if (def->type == VM_METHOD_TYPE_BMETHOD && def->body.bmethod.hooks) {
+            xfree(def->body.bmethod.hooks);
+        }
+        xfree(def);
+    }
+    else {
+        if (METHOD_DEBUG) fprintf(stderr, "-%p-%s:%d->%d (dec)\n", (void *)def, rb_id2name(def->original_id),
+                                  reference_count, def->reference_count);
+    }
+}
+
+static void
 rb_method_definition_release(rb_method_definition_t *def)
 {
-    if (def != NULL) {
-        const int reference_count = def->reference_count;
-        def->reference_count--;
-
-        VM_ASSERT(reference_count >= 0);
-
-        if (def->reference_count == 0) {
-            if (METHOD_DEBUG) fprintf(stderr, "-%p-%s:%d (remove)\n", (void *)def,
-                                      rb_id2name(def->original_id), def->reference_count);
-            if (def->type == VM_METHOD_TYPE_BMETHOD && def->body.bmethod.hooks) {
-                xfree(def->body.bmethod.hooks);
-            }
-            xfree(def);
-        }
-        else {
-            if (METHOD_DEBUG) fprintf(stderr, "-%p-%s:%d->%d (dec)\n", (void *)def, rb_id2name(def->original_id),
-                                      reference_count, def->reference_count);
-        }
+    if (def == NULL) return;
+    if (rb_multi_ractor_p()) {
+        RB_VM_LOCK_ENTER();
+        do_rb_method_definition_release(def);
+        RB_VM_LOCK_LEAVE();
+    } else {
+        do_rb_method_definition_release(def);
     }
 }
 
@@ -618,20 +629,39 @@ setup_method_cfunc_struct(rb_method_cfunc_t *cfunc, VALUE (*func)(ANYARGS), int 
     cfunc->invoker = call_cfunc_invoker_func(argc);
 }
 
-static rb_method_definition_t *
-method_definition_addref(rb_method_definition_t *def, bool complemented)
+static inline void
+do_method_definition_addref(rb_method_definition_t *def, bool complemented)
 {
     if (!complemented &&  def->reference_count > 0) def->aliased = true;
     def->reference_count++;
     if (METHOD_DEBUG) fprintf(stderr, "+%p-%s:%d\n", (void *)def, rb_id2name(def->original_id), def->reference_count);
+}
+
+static rb_method_definition_t *
+method_definition_addref(rb_method_definition_t *def, bool complemented)
+{
+    if (rb_multi_ractor_p()) {
+        RB_VM_LOCK_ENTER();
+        do_method_definition_addref(def, complemented);
+        RB_VM_LOCK_LEAVE();
+    } else {
+        do_method_definition_addref(def, complemented);
+    }
     return def;
 }
 
 void
 rb_method_definition_set(const rb_method_entry_t *me, rb_method_definition_t *def, void *opts)
 {
-    rb_method_definition_release(me->def);
-    *(rb_method_definition_t **)&me->def = method_definition_addref(def, METHOD_ENTRY_COMPLEMENTED(me));
+    if (rb_multi_ractor_p()) {
+        RB_VM_LOCK_ENTER();
+        rb_method_definition_release(me->def);
+        *(rb_method_definition_t **)&me->def = method_definition_addref(def, METHOD_ENTRY_COMPLEMENTED(me));
+        RB_VM_LOCK_LEAVE();
+    } else {
+        rb_method_definition_release(me->def);
+        *(rb_method_definition_t **)&me->def = method_definition_addref(def, METHOD_ENTRY_COMPLEMENTED(me));
+    }
 
     if (!ruby_running) add_opt_method_entry(me);
 
@@ -768,7 +798,9 @@ rb_method_definition_create(rb_method_type_t type, ID mid)
 static rb_method_entry_t *
 rb_method_entry_alloc(ID called_id, VALUE owner, VALUE defined_class, rb_method_definition_t *def, bool complement)
 {
-    if (def) method_definition_addref(def, complement);
+    if (def) {
+        method_definition_addref(def, complement);
+    }
     if (RTEST(defined_class)) {
         // not negative cache
         VM_ASSERT_TYPE2(defined_class, T_CLASS, T_ICLASS);
@@ -843,18 +875,21 @@ rb_method_entry_complement_defined_class(const rb_method_entry_t *src_me, ID cal
 
     if (!src_me->defined_class &&
         def->type == VM_METHOD_TYPE_REFINED &&
-        def->body.refined.orig_me) {
+        def->body.refined.orig_me)
+    {
         const rb_method_entry_t *orig_me =
             rb_method_entry_clone(def->body.refined.orig_me);
         RB_OBJ_WRITE((VALUE)orig_me, &orig_me->defined_class, defined_class);
         refined_orig_me = orig_me;
         def = NULL;
+        fprintf(stderr, "rb_method_entry_complement_defined_class:enter_if\n");
     }
 
     me = rb_method_entry_alloc(called_id, src_me->owner, defined_class, def, true);
     METHOD_ENTRY_FLAGS_COPY(me, src_me);
     METHOD_ENTRY_COMPLEMENTED_SET(me);
     if (!def) {
+        fprintf(stderr, "rb_method_entry_complement_defined_class:enter_!def\n");
         def = rb_method_definition_create(VM_METHOD_TYPE_REFINED, called_id);
         rb_method_definition_set(me, def, (void *)refined_orig_me);
     }
@@ -906,6 +941,7 @@ lookup_method_table(VALUE klass, ID id)
 {
     st_data_t body;
     struct rb_id_table *m_tbl = RCLASS_M_TBL(klass);
+    VM_ASSERT(m_tbl);
 
     if (rb_id_table_lookup(m_tbl, id, &body)) {
         return (rb_method_entry_t *) body;
@@ -1390,6 +1426,8 @@ prepare_callable_method_entry(VALUE defined_class, ID id, const rb_method_entry_
                 cme = rb_method_entry_complement_defined_class(me, me->called_id, defined_class);
                 rb_id_table_insert(mtbl, id, (VALUE)cme);
                 RB_OBJ_WRITTEN(defined_class, Qundef, (VALUE)cme);
+                // here, RB_OBJ_WRITTEN might have to be to the OWNER of the mtbl, maybe not
+                // `defined_class`
                 VM_ASSERT(callable_method_entry_p(cme));
             }
             else {

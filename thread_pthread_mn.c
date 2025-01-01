@@ -191,6 +191,7 @@ nt_alloc_thread_stack_chunk(void)
 
     const char *m = (void *)mmap(NULL, MSTACK_CHUNK_SIZE, PROT_READ | PROT_WRITE, mmap_flags, -1, 0);
     if (m == MAP_FAILED) {
+        fprintf(stderr, "mmap failed\n");
         return NULL;
     }
 
@@ -335,6 +336,9 @@ nt_alloc_stack(rb_vm_t *vm, void **vm_stack, void **machine_stack)
         }
     }
     rb_native_mutex_unlock(&nt_machine_stack_lock);
+    if (err) {
+        fprintf(stderr, "nt alloc stack err: %d\n", err);
+    }
 
     return err;
 }
@@ -391,7 +395,7 @@ nt_free_stack(void *mstack)
 
 
 static int
-native_thread_check_and_create_shared(rb_vm_t *vm)
+native_thread_check_and_create_shared(rb_vm_t *vm, rb_thread_t *th)
 {
     bool need_to_make = false;
 
@@ -422,13 +426,25 @@ native_thread_check_and_create_shared(rb_vm_t *vm)
     if (need_to_make) {
         struct rb_native_thread *nt = native_thread_alloc();
         nt->vm = vm;
+        if (th) {
+            debug_threads(stderr, "actually creating shared NT for thread %d: nt: %d\n", th->serial, nt->serial);
+        }
         return native_thread_create0(nt);
     }
     else {
+        if (th) {
+            debug_threads(stderr, "NOT creating shared NT for thread %d, already max amount\n", th->serial);
+        }
         return 0;
     }
 }
 
+// Arguments:
+//   self->th != NULL
+//   self->th->nt != NULL
+// Preconditions:
+//   self->th == TH_SCHED(th)->running
+//   sched is locked by ANOTHER thread
 static COROUTINE
 co_start(struct coroutine_context *from, struct coroutine_context *self)
 {
@@ -449,6 +465,7 @@ co_start(struct coroutine_context *from, struct coroutine_context *self)
     thread_sched_add_running_thread(TH_SCHED(th), th);
     thread_sched_unlock(sched, th);
     {
+        debug_threads(stderr, "co_start th:%d RESUMED\n", th->serial);
         RB_INTERNAL_THREAD_HOOK(RUBY_INTERNAL_THREAD_EVENT_RESUMED, th);
         call_thread_start_func_2(th);
     }
@@ -460,6 +477,7 @@ co_start(struct coroutine_context *from, struct coroutine_context *self)
 
     struct rb_native_thread *nt = th->nt;
     bool is_dnt = th_has_dedicated_nt(th);
+    debug_threads(stderr, "co_start after call_thread_start_func_2 for th:%d, is DNT now? %d\n", th->serial, is_dnt);
     native_thread_assign(NULL, th);
     rb_ractor_set_current_ec(th->ractor, NULL);
 
@@ -467,6 +485,7 @@ co_start(struct coroutine_context *from, struct coroutine_context *self)
         // SNT became DNT while running. Just return to the nt_context
 
         th->sched.finished = true;
+        debug_threads(stderr, "co_start after call_thread_start_func_2 for th:%d is DNT calling coroutine_transfer0\n", th->serial);
         coroutine_transfer0(self, nt->nt_context, true);
     }
     else {
@@ -475,16 +494,35 @@ co_start(struct coroutine_context *from, struct coroutine_context *self)
         rb_thread_t *next_th = sched->running;
 
         if (!has_ready_ractor && next_th && !next_th->nt) {
+            debug_threads(stderr, "co_start after call_thread_start_func_2 for th:%d, switching to next_th:%d\n", th->serial, next_th->serial);
             // switch to the next thread
             thread_sched_set_lock_owner(sched, NULL);
             thread_sched_switch0(th->sched.context, next_th, nt, true);
             th->sched.finished = true;
         }
         else {
+            if (next_th && !next_th->nt) {
+                debug_threads(stderr, "co_start after call_thread_start_func_2 for th:%d, no next_th, switching to next ractor, but ENQ first!!!!!!\n", th->serial);
+                ractor_sched_enq(next_th->vm, next_th->ractor, true);
+            } else {
+                debug_threads(stderr, "co_start after call_thread_start_func_2 for th:%d, no next_th, switching to next ractor\n", th->serial);
+            }
             // switch to the next Ractor
             th->sched.finished = true;
             coroutine_transfer0(self, nt->nt_context, true);
         }
+
+        /*if (!has_ready_ractor && next_th && !next_th->nt) {*/
+            /*// switch to the next thread*/
+            /*thread_sched_set_lock_owner(sched, NULL);*/
+            /*thread_sched_switch0(th->sched.context, next_th, nt, true);*/
+            /*th->sched.finished = true;*/
+        /*}*/
+        /*else {*/
+            /*// switch to the next Ractor*/
+            /*th->sched.finished = true;*/
+            /*coroutine_transfer0(self, nt->nt_context, true);*/
+        /*}*/
     }
 
     rb_bug("unreachable");
@@ -516,10 +554,14 @@ native_thread_create_shared(rb_thread_t *th)
     th->sched.context->argument = th;
 
     RUBY_DEBUG_LOG("th:%u vm_stack:%p machine_stack:%p", rb_th_serial(th), vm_stack, machine_stack);
-    thread_sched_to_ready(TH_SCHED(th), th);
+    debug_threads(stderr, "Creating thread: %d, enqeueing on ractor thread sched for ractor %d\n", th->serial, rb_ractor_id(th->ractor));
 
-    // setup nt
-    return native_thread_check_and_create_shared(th->vm);
+    err = native_thread_check_and_create_shared(th->vm, th);
+    if (!err) {
+        // setup nt
+        thread_sched_to_ready(TH_SCHED(th), th);
+    }
+    return err;
 }
 
 #else // USE_MN_THREADS
@@ -611,6 +653,7 @@ kqueue_wait(rb_vm_t *vm)
         timeout = &calculated_timeout;
     }
 
+    debug_threads(stderr, "Timer thread: kevent with timeout of %d ms\n", timeout_ms);
     return kevent(timer_th.event_fd, NULL, 0, timer_th.finished_events, KQUEUE_EVENTS_MAX, timeout);
 }
 
@@ -914,6 +957,7 @@ timer_thread_polling(rb_vm_t *vm)
     switch (r) {
       case 0: // timeout
         RUBY_DEBUG_LOG("timeout%s", "");
+        debug_threads(stderr, "Timer thread polling: timeout (event 0)\n");
 
         ractor_sched_lock(vm, NULL);
         {
@@ -929,13 +973,14 @@ timer_thread_polling(rb_vm_t *vm)
         ractor_sched_unlock(vm, NULL);
 
         // (1-2)
-        native_thread_check_and_create_shared(vm);
+        native_thread_check_and_create_shared(vm, NULL);
 
         break;
 
       case -1:
         switch (errno) {
           case EINTR:
+            debug_threads(stderr, "Timer thread polling: error (event -1): EINTR\n");
             // simply retry
             break;
           default:
@@ -947,6 +992,7 @@ timer_thread_polling(rb_vm_t *vm)
       default:
         RUBY_DEBUG_LOG("%d event(s)", r);
 
+        debug_threads(stderr, "Timer thread polling: %d events\n", r);
 #if HAVE_SYS_EVENT_H
         for (int i=0; i<r; i++) {
             rb_thread_t *th = (rb_thread_t *)timer_th.finished_events[i].udata;
@@ -965,6 +1011,11 @@ timer_thread_polling(rb_vm_t *vm)
                                 (filter == EVFILT_READ) ? "read/" : "",
                                 (filter == EVFILT_WRITE) ? "write/" : "");
 
+                debug_threads(stderr, "Timer thread polling: wakeup_th %d, event: %s%s\n",
+                                (filter == EVFILT_READ) ? "read/" : "",
+                                (filter == EVFILT_WRITE) ? "write/" : "",
+                                th->serial
+                              );
                 rb_native_mutex_lock(&timer_th.waiting_lock);
                 {
                     if (th->sched.waiting_reason.flags) {
@@ -1043,6 +1094,7 @@ static void
 timer_thread_polling(rb_vm_t *vm)
 {
     int timeout = timer_thread_set_timeout(vm);
+    debug_threads(stderr, "Timer thread polling (poll): with timeout %d\n", timeout);
 
     struct pollfd pfd = {
         .fd = timer_th.comm_fds[0],
@@ -1053,6 +1105,7 @@ timer_thread_polling(rb_vm_t *vm)
 
     switch (r) {
       case 0: // timeout
+        debug_threads(stderr, "Timer thread polling (poll): got timeout (event 0)\n");
         rb_native_mutex_lock(&vm->ractor.sched.lock);
         {
             // (1-1) timeslice
@@ -1064,6 +1117,7 @@ timer_thread_polling(rb_vm_t *vm)
       case -1: // error
         switch (errno) {
           case EINTR:
+            debug_threads(stderr, "Timer thread polling (poll): got error EINTR\n");
             // simply retry
             break;
           default:
@@ -1073,11 +1127,12 @@ timer_thread_polling(rb_vm_t *vm)
         }
 
       case 1:
+        debug_threads(stderr, "Timer thread polling: got 1\n");
         consume_communication_pipe(timer_th.comm_fds[0]);
         break;
 
       default:
-        rb_bug("unreachbale");
+        rb_bug("unreachable");
     }
 }
 

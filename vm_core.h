@@ -20,7 +20,8 @@
 // respect RUBY_DUBUG: if given n is 0, then use RUBY_DEBUG
 #define N_OR_RUBY_DEBUG(n) (((n) > 0) ? (n) : RUBY_DEBUG)
 
-#define VM_CHECK_MODE N_OR_RUBY_DEBUG(0)
+//#define VM_CHECK_MODE N_OR_RUBY_DEBUG(0)
+#define VM_CHECK_MODE 1
 #endif
 
 /**
@@ -108,7 +109,7 @@ extern int ruby_assert_critical_section_entered;
 # include <setjmp.h>
 #endif
 
-#if defined(__linux__) || defined(__FreeBSD__)
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__APPLE__)
 # define RB_THREAD_T_HAS_NATIVE_ID
 #endif
 
@@ -663,8 +664,20 @@ struct global_object_list {
     struct global_object_list *next;
 };
 
+// Luke
+#ifndef DEBUG_THREADS
+  #define DEBUG_THREADS 1
+#endif
+
+#if DEBUG_THREADS
+    void debug_threads(FILE *f, const char *fmt, ...);
+#else
+  #define debug_threads (void)0
+#endif
+
 typedef struct rb_vm_struct {
     VALUE self;
+    rb_nativethread_lock_t debug_print_lock;
 
     struct {
         struct ccan_list_head set;

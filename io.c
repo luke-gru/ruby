@@ -15,6 +15,7 @@
 
 #include "ruby/fiber/scheduler.h"
 #include "ruby/io/buffer.h"
+#include "ractor_core.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -2159,7 +2160,10 @@ io_binwritev(struct iovec *iov, int iovcnt, rb_io_t *fptr)
     arg.total = total;
 
     if (!NIL_P(fptr->write_lock)) {
-        return rb_mutex_synchronize(fptr->write_lock, io_binwritev_internal, (VALUE)&arg);
+        debug_threads(stderr, "rb_mutex_synchronize io_binwritev_internal before r:%d\n", rb_ractor_id(GET_RACTOR()));
+        long ret = rb_mutex_synchronize(fptr->write_lock, io_binwritev_internal, (VALUE)&arg);
+        debug_threads(stderr, "rb_mutex_synchronize io_binwritev_internal after r:%d\n", rb_ractor_id(GET_RACTOR()));
+        return ret;
     }
     else {
         return io_binwritev_internal((VALUE)&arg);

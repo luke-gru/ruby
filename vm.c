@@ -4282,6 +4282,8 @@ Init_BareVM(void)
     // setup the VM
     vm_init2(vm);
 
+    rb_native_mutex_initialize(&vm->debug_print_lock);
+
     rb_vm_postponed_job_queue_init(vm);
     ruby_current_vm_ptr = vm;
     rb_objspace_alloc();

@@ -291,6 +291,15 @@ class Ractor
     }
   end
 
+  # returns all ractors
+  def self.all
+  end
+
+  # returns all ractors
+  def self.remaining
+    return Primitive.ractors_remaining
+  end
+
   # Returns the number of Ractors currently running or blocking (waiting).
   #
   #    Ractor.count                   #=> 1
@@ -728,6 +737,11 @@ class Ractor
   # The name set in Ractor.new, or +nil+.
   def name
     __builtin_cexpr! %q{RACTOR_PTR(self)->name}
+  end
+
+  def my_id
+    id = __builtin_cexpr! %q{ UINT2NUM(rb_ractor_id(RACTOR_PTR(self))) }
+    id
   end
 
   class RemoteError

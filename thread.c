@@ -171,15 +171,15 @@ static void unblock_function_clear(rb_thread_t *th);
 
 static inline int blocking_region_begin(rb_thread_t *th, struct rb_blocking_region_buffer *region,
                                         rb_unblock_function_t *ubf, void *arg, int fail_if_interrupted);
-static inline void blocking_region_end(rb_thread_t *th, struct rb_blocking_region_buffer *region);
+static inline void blocking_region_end(rb_thread_t *th, struct rb_native_thread *nt, enum nt_blocked_reason prev_nt_blocked_reason, struct rb_blocking_region_buffer *region, bool allow_no_blocking_reason);
 
 #define THREAD_BLOCKING_BEGIN(th) do { \
   struct rb_thread_sched * const sched = TH_SCHED(th); \
   RB_VM_SAVE_MACHINE_CONTEXT(th); \
-  thread_sched_to_waiting((sched), (th));
+  thread_sched_to_waiting((sched), (th), true);
 
 #define THREAD_BLOCKING_END(th) \
-  thread_sched_to_running((sched), (th)); \
+  thread_sched_to_running((sched), (th), true); \
   rb_ractor_thread_switch(th->ractor, th); \
 } while(0)
 
@@ -201,9 +201,11 @@ static inline void blocking_region_end(rb_thread_t *th, struct rb_blocking_regio
          * blocking_region_begin - see bug #20493 */ \
         RB_VM_SAVE_MACHINE_CONTEXT(th); \
         debug_threads(stderr, "blocking_region_begin th:%d\n", th->serial); \
-        thread_sched_to_waiting(TH_SCHED(th), th); \
+        struct rb_native_thread *nt = th->nt; \
+        native_thread_set_blocked(th->nt, NT_BLOCKED_BLOCKING_REGION); \
+        thread_sched_to_waiting(TH_SCHED(th), th, true); \
         exec; \
-        blocking_region_end(th, &__region); \
+        blocking_region_end(th, nt, nt->blocked_reason, &__region, false); \
         debug_threads(stderr, "blocking_region_end th:%d\n", th->serial); \
     }; \
 } while(0)
@@ -1515,12 +1517,29 @@ rb_thread_schedule_limits(uint32_t limits_us)
         if (th->running_time_us >= limits_us) {
             RUBY_DEBUG_LOG("switch %s", "start");
 
+            debug_threads(stderr, "rb_thread_schedule_limits switch, start yielding th:%d r:%d\n",
+                th->serial, rb_ractor_id(th->ractor)
+            );
             RB_VM_SAVE_MACHINE_CONTEXT(th);
             thread_sched_yield(TH_SCHED(th), th);
             rb_ractor_thread_switch(th->ractor, th);
 
+            debug_threads(stderr, "rb_thread_schedule_limits switch, finished yielding th:%d r:%d\n",
+                th->serial, rb_ractor_id(th->ractor)
+            );
+
             RUBY_DEBUG_LOG("switch %s", "done");
+        } else {
+            debug_threads(stderr, "rb_thread_schedule_limits, time < limit (no switch) th:%d r:%d\n",
+                th->serial, rb_ractor_id(th->ractor)
+            );
         }
+    } else {
+        rb_thread_t *th = GET_THREAD();
+        (void)th;
+        debug_threads(stderr, "rb_thread_schedule_limits, only 1 thread (no switch) th:%d r:%d\n",
+            th->serial, rb_ractor_id(th->ractor)
+        );
     }
 }
 
@@ -1557,20 +1576,43 @@ blocking_region_begin(rb_thread_t *th, struct rb_blocking_region_buffer *region,
 }
 
 static inline void
-blocking_region_end(rb_thread_t *th, struct rb_blocking_region_buffer *region)
+blocking_region_end(rb_thread_t *th, struct rb_native_thread *nt, enum nt_blocked_reason nt_block_reason, struct rb_blocking_region_buffer *region, bool allow_no_blocked_reason)
 {
+    VM_ASSERT(th->nt == nt);
+
     /* entry to ubf_list still permitted at this point, make it impossible: */
     unblock_function_clear(th);
     /* entry to ubf_list impossible at this point, so unregister is safe: */
     unregister_ubf_list(th);
 
-    thread_sched_to_running(TH_SCHED(th), th);
+    // is NT_BLOCKED_NONE if called from rb_thread_call_with_gvl
+    if (nt_block_reason != NT_BLOCKED_NONE) {
+        native_thread_set_unblocked(th->nt);
+    } else {
+        VM_ASSERT(allow_no_blocked_reason);
+    }
+    if (!th->nt->is_dnt) {
+        debug_threads(stderr, "WAIT FOR SIG SNT AFTER BLOCKING REGION\n");
+    }
+    // Waits for the thread to be ready to run. Another native thread may have picked up another thread on this
+    // ractor, so we could have to wait for our turn. In this case we block on this nt's condition variable.
+    thread_sched_to_running(TH_SCHED(th), th, true);
+    // thread is ready to switch to
     rb_ractor_thread_switch(th->ractor, th);
-
-    th->blocking_region_buffer = 0;
     rb_ractor_blocking_threads_dec(th->ractor, __FILE__, __LINE__);
+
+    if (th->blocking_region_buffer == region) {
+        th->blocking_region_buffer = 0;
+    }
+
     if (th->status == THREAD_STOPPED) {
         th->status = region->prev_status;
+    }
+
+    if (!th->nt->is_dnt) {
+        debug_threads(stderr, "RESUME SNT AFTER BLOCKING REGION (%d->%d)\n",
+            region->prev_status, th->status
+        );
     }
 
     RUBY_DEBUG_LOG("end");
@@ -1977,14 +2019,19 @@ rb_thread_call_with_gvl(void *(*func)(void *), void *data1)
         rb_bug("rb_thread_call_with_gvl: called by a thread which has GVL.");
     }
 
-    blocking_region_end(th, brb);
+    debug_threads(stderr, "rb_thread_call_with_gvl\n");
+    enum nt_blocked_reason prev_blocked_reason = th->nt->blocked_reason;
+    blocking_region_end(th, th->nt, th->nt->blocked_reason, brb, true);
+    native_thread_set_blocked_unchecked(th->nt, NT_BLOCKED_BLOCKING_REGION);
     /* enter to Ruby world: You can access Ruby values, methods and so on. */
     r = (*func)(data1);
     /* leave from Ruby world: You can not access Ruby values, etc. */
     int released = blocking_region_begin(th, brb, prev_unblock.func, prev_unblock.arg, FALSE);
     RUBY_ASSERT_ALWAYS(released);
     RB_VM_SAVE_MACHINE_CONTEXT(th);
-    thread_sched_to_waiting(TH_SCHED(th), th);
+    thread_sched_to_waiting(TH_SCHED(th), th, true);
+    native_thread_set_blocked_unchecked(th->nt, prev_blocked_reason);
+    debug_threads(stderr, "rb_thread_call_with_gvl after, th:%d waiting\n", th->serial);
     return r;
 }
 
@@ -2503,6 +2550,7 @@ threadptr_get_interrupts(rb_thread_t *th)
 
 static void threadptr_interrupt_exec_exec(rb_thread_t *th);
 
+// Luke: execute interrupts on current thread
 int
 rb_threadptr_execute_interrupts(rb_thread_t *th, int blocking_timing)
 {
@@ -2604,6 +2652,9 @@ rb_threadptr_execute_interrupts(rb_thread_t *th, int blocking_timing)
             VM_ASSERT(th->ec->cfp);
             EXEC_EVENT_HOOK(th->ec, RUBY_INTERNAL_EVENT_SWITCH, th->ec->cfp->self,
                             0, 0, 0, Qundef);
+            debug_threads(stderr, "rb_threadptr_execute_interrupts th:%d switch event (maybe)\n",
+                th->serial
+            );
 
             rb_thread_schedule_limits(limits_us);
         }

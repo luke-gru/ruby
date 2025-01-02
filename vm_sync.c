@@ -86,7 +86,7 @@ vm_lock_enter(rb_ractor_t *cr, rb_vm_t *vm, bool locked, bool no_barrier, unsign
             do {
                 VM_ASSERT(vm_need_barrier_waiting(vm));
                 RUBY_DEBUG_LOG("barrier serial:%u", vm->ractor.sched.barrier_serial);
-                rb_ractor_sched_barrier_join(vm, cr);
+                rb_ractor_sched_barrier_join(vm, cr); // Luke: NOTE: only use
             } while (vm_need_barrier_waiting(vm));
         }
 

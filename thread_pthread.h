@@ -71,6 +71,13 @@ struct rb_thread_sched_item {
     struct coroutine_context *context;
 };
 
+enum nt_blocked_reason {
+    NT_BLOCKED_NONE = 0,
+    NT_BLOCKED_BLOCKING_REGION,
+    NT_BLOCKED_RACTOR_SCHED_DEQ,
+    NT_BLOCKED_DEDICATED_READYQ
+};
+
 struct rb_native_thread {
     rb_atomic_t serial;
     struct rb_vm_struct *vm;
@@ -80,6 +87,7 @@ struct rb_native_thread {
 #ifdef RB_THREAD_T_HAS_NATIVE_ID
     int tid;
 #endif
+    enum nt_blocked_reason blocked_reason; // for both DNTs and SNTs
 
     struct rb_thread_struct *running_thread;
 
@@ -103,7 +111,8 @@ struct rb_native_thread {
 #endif
 
     struct coroutine_context *nt_context;
-    int dedicated;
+    int dedicated; // snts can have dedicated > 0 if they are locked to a thread, waiting for it to be ready
+    bool is_dnt;
 
     size_t machine_stack_maxsize;
 };

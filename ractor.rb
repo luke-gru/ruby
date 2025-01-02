@@ -366,6 +366,7 @@ class Ractor
   # +move+ boolean flag defines whether yielded value will be copied (default) or moved.
   def self.select(*ractors, yield_value: yield_unspecified = true, move: false)
     raise ArgumentError, 'specify at least one ractor or `yield_value`' if yield_unspecified && ractors.empty?
+    ractors = ractors.flatten
 
     if ractors.delete Ractor.current
       do_receive = true

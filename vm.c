@@ -569,7 +569,6 @@ rb_current_ec_set(rb_execution_context_t *ec)
     ruby_current_ec = ec;
 }
 
-
 #ifdef __APPLE__
 rb_execution_context_t *
 rb_current_ec(void)

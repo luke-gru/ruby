@@ -179,7 +179,7 @@ static inline void blocking_region_end(rb_thread_t *th, struct rb_native_thread 
   thread_sched_to_waiting((sched), (th), true);
 
 #define THREAD_BLOCKING_END(th) \
-  thread_sched_to_running((sched), (th), true); \
+  thread_sched_to_running((sched), (th)); \
   rb_ractor_thread_switch(th->ractor, th); \
 } while(0)
 
@@ -370,6 +370,7 @@ threadptr_interrupt_locked(rb_thread_t *th, bool trap)
 static void
 threadptr_interrupt(rb_thread_t *th, int trap)
 {
+    debug_threads(stderr, "threadptr_interrupt th:%d\n", th->serial);
     rb_native_mutex_lock(&th->interrupt_lock);
     {
         threadptr_interrupt_locked(th, trap);
@@ -399,6 +400,9 @@ terminate_all(rb_ractor_t *r, const rb_thread_t *main_thread)
         if (th != main_thread) {
             RUBY_DEBUG_LOG("terminate start th:%u status:%s", rb_th_serial(th), thread_status_name(th, TRUE));
 
+            debug_threads(stderr, "terminate_all: sending interrupt to non-main thread r:%d th:%d, status:%s\n",
+                rb_ractor_id(r), th->serial, thread_status_name(th, TRUE)
+            );
             rb_threadptr_pending_interrupt_enque(th, RUBY_FATAL_THREAD_TERMINATED);
             rb_threadptr_interrupt(th);
 
@@ -425,6 +429,7 @@ rb_threadptr_join_list_wakeup(rb_thread_t *thread)
             rb_fiber_scheduler_unblock(target_thread->scheduler, target_thread->self, rb_fiberptr_self(join_list->fiber));
         }
         else {
+            debug_threads(stderr, "rb_threadptr_join_list_wakeup: th:%d\n", thread->serial);
             rb_threadptr_interrupt(target_thread);
 
             switch (target_thread->status) {
@@ -443,6 +448,7 @@ void
 rb_threadptr_unlock_all_locking_mutexes(rb_thread_t *th)
 {
     while (th->keeping_mutexes) {
+        debug_threads(stderr, "rb_threadptr_unlock_all_locking_mutexes: Unlocking mutex for th:%d\n", th->serial);
         rb_mutex_t *mutex = th->keeping_mutexes;
         th->keeping_mutexes = mutex->next_mutex;
 
@@ -473,6 +479,8 @@ rb_thread_terminate_all(rb_thread_t *th)
     );
     /* unlock all locking mutexes */
     rb_threadptr_unlock_all_locking_mutexes(th);
+
+    if (th->ractor->threads.cnt == 1) return;
 
     EC_PUSH_TAG(ec);
     if (EC_EXEC_TAG() == TAG_NONE) {
@@ -796,7 +804,7 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
     }
 
     if (ractor_main_th->status == THREAD_KILLED &&
-        th->ractor->threads.cnt <= 2 /* main thread and this thread */) {
+        th->ractor->threads.cnt <= 2 && th != ractor_main_th /* main thread and this thread */) {
         /* I'm last thread. wake up main thread from rb_thread_terminate_all */
         rb_threadptr_interrupt(ractor_main_th);
     }
@@ -1506,37 +1514,40 @@ rb_thread_sleep(int sec)
     debug_threads(stderr, "rb_thread_sleep th:%d\n", GET_THREAD()->serial);
     rb_thread_wait_for(rb_time_timeval(INT2FIX(sec)));
 }
+static inline int rb_thread_alone_ractor(rb_ractor_t *ractor);
 
 static void
-rb_thread_schedule_limits(uint32_t limits_us)
+rb_thread_schedule_limits(rb_thread_t *th, uint32_t limits_us)
 {
-    if (!rb_thread_alone()) {
-        rb_thread_t *th = GET_THREAD();
+    if (!rb_thread_alone_ractor(th->ractor)) {
         RUBY_DEBUG_LOG("us:%u", (unsigned int)limits_us);
 
         if (th->running_time_us >= limits_us) {
+            EXEC_EVENT_HOOK(th->ec, RUBY_INTERNAL_EVENT_SWITCH, th->ec->cfp->self,
+                            0, 0, 0, Qundef);
             RUBY_DEBUG_LOG("switch %s", "start");
 
-            debug_threads(stderr, "rb_thread_schedule_limits switch, start yielding th:%d r:%d\n",
-                th->serial, rb_ractor_id(th->ractor)
+            debug_threads(stderr, "rb_thread_schedule_limits switch, start yielding th:%d r:%d (time:%zu)\n",
+                th->serial, rb_ractor_id(th->ractor), th->running_time_us / 1000
             );
-            RB_VM_SAVE_MACHINE_CONTEXT(th);
-            thread_sched_yield(TH_SCHED(th), th);
-            rb_ractor_thread_switch(th->ractor, th);
+            if (thread_sched_yield(TH_SCHED(th), th)) {
+                rb_ractor_thread_switch(th->ractor, th);
+                if (th->running_time_us > 0) {
+                    debug_threads(stderr, "rb_thread_schedule_limits switch, after yield time no change!!\n");
+                }
+            }
 
-            debug_threads(stderr, "rb_thread_schedule_limits switch, finished yielding th:%d r:%d\n",
-                th->serial, rb_ractor_id(th->ractor)
+            debug_threads(stderr, "rb_thread_schedule_limits switch, finished yielding th:%d r:%d (time:%zu)\n",
+                th->serial, rb_ractor_id(th->ractor), th->running_time_us / 1000
             );
 
             RUBY_DEBUG_LOG("switch %s", "done");
         } else {
-            debug_threads(stderr, "rb_thread_schedule_limits, time < limit (no switch) th:%d r:%d\n",
-                th->serial, rb_ractor_id(th->ractor)
+            debug_threads(stderr, "rb_thread_schedule_limits, time < limit (no switch) th:%d r:%d (time:%zu)\n",
+                th->serial, rb_ractor_id(th->ractor), th->running_time_us / 1000
             );
         }
     } else {
-        rb_thread_t *th = GET_THREAD();
-        (void)th;
         debug_threads(stderr, "rb_thread_schedule_limits, only 1 thread (no switch) th:%d r:%d\n",
             th->serial, rb_ractor_id(th->ractor)
         );
@@ -1546,7 +1557,7 @@ rb_thread_schedule_limits(uint32_t limits_us)
 void
 rb_thread_schedule(void)
 {
-    rb_thread_schedule_limits(0);
+    rb_thread_schedule_limits(GET_THREAD(), 0);
     RUBY_VM_CHECK_INTS(GET_EC());
 }
 
@@ -1591,25 +1602,25 @@ blocking_region_end(rb_thread_t *th, struct rb_native_thread *nt, enum nt_blocke
     } else {
         VM_ASSERT(allow_no_blocked_reason);
     }
-    if (!th->nt->is_dnt) {
-        debug_threads(stderr, "WAIT FOR SIG SNT AFTER BLOCKING REGION\n");
+    if (!th->nt->is_permanent_dnt) {
+        debug_threads(stderr, "WAIT FOR TURN SNT AFTER BLOCKING REGION\n");
     }
     // Waits for the thread to be ready to run. Another native thread may have picked up another thread on this
     // ractor, so we could have to wait for our turn. In this case we block on this nt's condition variable.
-    thread_sched_to_running(TH_SCHED(th), th, true);
+    thread_sched_to_running(TH_SCHED(th), th);
     // thread is ready to switch to
     rb_ractor_thread_switch(th->ractor, th);
     rb_ractor_blocking_threads_dec(th->ractor, __FILE__, __LINE__);
 
-    if (th->blocking_region_buffer == region) {
+    /*if (th->blocking_region_buffer == region) {*/
         th->blocking_region_buffer = 0;
-    }
+    /*}*/
 
     if (th->status == THREAD_STOPPED) {
         th->status = region->prev_status;
     }
 
-    if (!th->nt->is_dnt) {
+    if (!th->nt->is_permanent_dnt) {
         debug_threads(stderr, "RESUME SNT AFTER BLOCKING REGION (%d->%d)\n",
             region->prev_status, th->status
         );
@@ -2574,8 +2585,10 @@ rb_threadptr_execute_interrupts(rb_thread_t *th, int blocking_timing)
         terminate_interrupt = interrupt & TERMINATE_INTERRUPT_MASK; // request from other ractors
 
         if (interrupt & VM_BARRIER_INTERRUPT_MASK) {
+            debug_threads(stderr, "Executing barrier interrupt VM_LOCK_ENTER\n");
             RB_VM_LOCK_ENTER();
             RB_VM_LOCK_LEAVE();
+            debug_threads(stderr, "Executing barrier interrupt /VM_LOCK_LEAVE\n");
         }
 
         if (postponed_job_interrupt) {
@@ -2641,22 +2654,19 @@ rb_threadptr_execute_interrupts(rb_thread_t *th, int blocking_timing)
         if (timer_interrupt) {
             uint32_t limits_us = TIME_QUANTUM_USEC;
 
-            if (th->priority > 0)
+            if (th->priority > 0) { // Luke: figure out when this is > 0
                 limits_us <<= th->priority;
-            else
+            } else {
                 limits_us >>= -th->priority;
+            }
 
-            if (th->status == THREAD_RUNNABLE)
-                th->running_time_us += 10 * 1000; // 10ms = 10_000us // TODO: use macro
-
+            th->running_time_us += (10 * 1000);
             VM_ASSERT(th->ec->cfp);
-            EXEC_EVENT_HOOK(th->ec, RUBY_INTERNAL_EVENT_SWITCH, th->ec->cfp->self,
-                            0, 0, 0, Qundef);
-            debug_threads(stderr, "rb_threadptr_execute_interrupts th:%d switch event (maybe)\n",
-                th->serial
+            debug_threads(stderr, "rb_threadptr_execute_interrupts th:%d (prio:%d) switch event (maybe) limit_ms:%zums th->running_time:%zums\n",
+                th->serial, th->priority, limits_us / 1000, th->running_time_us / 1000
             );
 
-            rb_thread_schedule_limits(limits_us);
+            rb_thread_schedule_limits(th, limits_us);
         }
     }
     return ret;
@@ -3958,6 +3968,12 @@ rb_thread_alone(void)
 {
     // TODO
     return rb_ractor_living_thread_num(GET_RACTOR()) == 1;
+}
+
+static inline int
+rb_thread_alone_ractor(rb_ractor_t *ractor)
+{
+    return rb_ractor_living_thread_num(ractor) == 1;
 }
 
 /*
@@ -5710,6 +5726,7 @@ rb_check_deadlock(rb_ractor_t *r)
     if (r->threads.sched.readyq_cnt > 0) return;
 #endif
 
+    debug_threads(stderr, "rb_check_deadlock: r:%d\n", rb_ractor_id(r));
     int sleeper_num = rb_ractor_sleeper_thread_num(r);
     int ltnum = rb_ractor_living_thread_num(r);
 
@@ -6115,6 +6132,7 @@ rb_threadptr_interrupt_exec(rb_thread_t *th, rb_interrupt_exec_func_t *func, voi
         .data = data,
     };
 
+    debug_threads(stderr, "rb_threadptr_interrupt_exec th:%d\n", th->serial);
     rb_native_mutex_lock(&th->interrupt_lock);
     {
         ccan_list_add_tail(&th->interrupt_exec_tasks, &task->node);

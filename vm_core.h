@@ -21,7 +21,7 @@
 #define N_OR_RUBY_DEBUG(n) (((n) > 0) ? (n) : RUBY_DEBUG)
 
 //#define VM_CHECK_MODE N_OR_RUBY_DEBUG(0)
-#define VM_CHECK_MODE 1
+#define VM_CHECK_MODE 0
 #endif
 
 /**
@@ -665,6 +665,7 @@ struct global_object_list {
 };
 
 // Luke
+#define DEBUG_THREADS 0
 #ifndef DEBUG_THREADS
   #define DEBUG_THREADS 1
 #endif
@@ -672,7 +673,7 @@ struct global_object_list {
 #if DEBUG_THREADS
     void debug_threads(FILE *f, const char *fmt, ...);
 #else
-  #define debug_threads (void)0
+  #define debug_threads(...) (void)0
 #endif
 
 typedef struct rb_vm_struct {
@@ -2138,7 +2139,8 @@ rb_vm_check_ints(rb_execution_context_t *ec)
     VM_ASSERT(ruby_assert_critical_section_entered == 0);
 #endif
 
-    VM_ASSERT(ec == GET_EC());
+    // Luke: this was causing perf problems in debug mode
+    //VM_ASSERT(ec == GET_EC());
 
     if (UNLIKELY(RUBY_VM_INTERRUPTED_ANY(ec))) {
         rb_threadptr_execute_interrupts(rb_ec_thread_ptr(ec), 0);

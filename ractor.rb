@@ -364,7 +364,7 @@ class Ractor
   #    Received nil from :yield
   #
   # +move+ boolean flag defines whether yielded value will be copied (default) or moved.
-  def self.select(*ractors, yield_value: yield_unspecified = true, move: false)
+  def self.select(*ractors, yield_value: yield_unspecified = true, move: false, timeout: nil)
     raise ArgumentError, 'specify at least one ractor or `yield_value`' if yield_unspecified && ractors.empty?
     ractors = ractors.flatten
 
@@ -374,7 +374,7 @@ class Ractor
       do_receive = false
     end
 
-    __builtin_ractor_select_internal ractors, do_receive, !yield_unspecified, yield_value, move
+    __builtin_ractor_select_internal ractors, do_receive, !yield_unspecified, yield_value, move, timeout
   end
 
   #

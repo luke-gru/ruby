@@ -41,14 +41,17 @@ ubf_event_waiting(void *ptr)
     th->unblock.func = NULL;
     th->unblock.arg = NULL;
 
-    bool canceled = timer_thread_cancel_waiting(th);
+    bool cancelled = timer_thread_cancel_waiting(th);
+    debug_threads(stderr, "ubf_event_waiting t:%d, cancelled:%d, sched->running==th:%d\n",
+        th->serial, cancelled, sched->running == th
+    );
 
     thread_sched_lock(sched, th);
     {
         if (sched->running == th) {
             RUBY_DEBUG_LOG("not waiting yet");
         }
-        else if (canceled) {
+        else if (cancelled) {
             thread_sched_to_ready_common(sched, th, true, false);
         }
         else {
@@ -75,7 +78,7 @@ thread_sched_wait_events(struct rb_thread_sched *sched, rb_thread_t *th, int fd,
         setup_ubf(th, ubf_event_waiting, (void *)th);
 
         RB_INTERNAL_THREAD_HOOK(RUBY_INTERNAL_THREAD_EVENT_SUSPENDED, th);
-        debug_threads(stderr, "thread_sched_wait_events: th:%d\n", th->serial);
+        debug_threads(stderr, "thread_sched_wait_events start: th:%d, status:%d\n", th->serial, th->status);
 
         thread_sched_lock(sched, th);
         {
@@ -88,13 +91,25 @@ thread_sched_wait_events(struct rb_thread_sched *sched, rb_thread_t *th, int fd,
                 need_cancel = true;
             }
             else {
+                /*if (th->status == THREAD_STOPPED_FOREVER) {*/
+                    /*thread_sched_unlock(sched, th);*/
+                    /*return th->sched.waiting_reason.data.result == 0;*/
+                /*}*/
                 RUBY_DEBUG_LOG("sleep");
-
                 debug_threads(stderr, "thread_sched_wait_events: th:%d, th wait_running_turn\n", th->serial);
                 th->status = THREAD_STOPPED_FOREVER;
+                // Luke:
+                //   increase th->nt->dedicated
+                //   wakeup next thread, set to running even if null
+                //   wakeup the next thread if not null
+                //   delete the running thread from timeslices
+                /*thread_sched_to_waiting_common(sched, th, true); // also wakes up next thread, if any*/
+                /*thread_sched_enq_check_simple(sched, th);*/
+                /*VM_ASSERT(th->nt->dedicated);*/
                 thread_sched_wakeup_next_thread(sched, th, NULL, false, true);
-                debug_threads(stderr, "thread_sched_wait_events: th:%d, wakeup after\n", th->serial);
-                thread_sched_wait_running_turn(sched, th, true, false);
+                /*debug_threads(stderr, "thread_sched_wait_events: th:%d, after to_waiting_common\n", th->serial);*/
+                thread_sched_wait_running_turn(sched, th, true);
+                /*thread_sched_wait_running_turn(sched, th, true);*/
                 debug_threads(stderr, "thread_sched_wait_events: th:%d, wait running turn after\n", th->serial);
 
                 RUBY_DEBUG_LOG("wakeup");
@@ -413,14 +428,15 @@ native_thread_check_and_create_shared(rb_vm_t *vm, rb_thread_t *th, bool from_ti
 
         // NOTE: there should probably be a max amount of real_snt count (or DNT + SNT)
         if (((int)snt_cnt < MINIMUM_SNT) ||
-            (snt_cnt < vm->ractor.cnt  &&
+            (snt_cnt < (vm->ractor.cnt)  &&
              snt_cnt < vm->ractor.sched.max_cpu)) {
 
-            debug_threads(stderr, "Creating SNT. snt:%d dnt:%d: ractor.cnt:%d ractor ractor.grq_cnt:%d (timer:%d)\n",
+            debug_threads(stderr, "Creating SNT. snt:%d dnt:%d: ractor.cnt:%d ractor ractor.grq_cnt:%d, max_cpu:%d (timer:%d)\n",
                 vm->ractor.sched.snt_cnt,
                 vm->ractor.sched.dnt_cnt,
                 vm->ractor.cnt,
                 vm->ractor.sched.grq_cnt,
+                vm->ractor.sched.max_cpu,
                 from_timer
             );
 
@@ -442,16 +458,16 @@ native_thread_check_and_create_shared(rb_vm_t *vm, rb_thread_t *th, bool from_ti
     if (need_to_make) {
         struct rb_native_thread *nt = native_thread_alloc();
         nt->vm = vm;
-        nt->is_dnt = false;
+        nt->is_permanent_dnt = false;
         return native_thread_create0(nt);
     }
     else {
         if (th) {
-            debug_threads(stderr, "NOT creating SNT for th:%d, already max amount (timer:%d)\n",
+            debug_threads(stderr, "Don't create SNT for th:%d, already max amount (timer:%d)\n",
                 th->serial, from_timer
             );
         } else {
-            debug_threads(stderr, "NOT creating SNT, already max amount (timer:%d)\n",
+            debug_threads(stderr, "Don't create SNT, already max amount (timer:%d)\n",
                 from_timer
             );
         }
@@ -524,15 +540,17 @@ co_start(struct coroutine_context *from, struct coroutine_context *self)
 
         if (!has_ready_ractor && next_th && !next_th->nt) {
             debug_threads(stderr, "co_start after call_thread_start_func_2 for th:%d, switching to next_th:%d\n", th->serial, next_th->serial);
-            // switch to the next thread, could be on another ractor
+            // switch to the next thread on same ractor
             thread_sched_set_lock_owner(sched, NULL);
             thread_sched_switch0(th->sched.context, next_th, nt, true);
             th->sched.finished = true;
         }
         else {
+            // TODO: check if sched->nts_num < sched->threads_num because another native
+            // thread from timer or something could have enqueued this ractor
             if (next_th && !next_th->nt) {
-                debug_threads(stderr, "co_start after call_thread_start_func_2 for th:%d next_th:%d switching to next ractor, but ENQ first!!!\n",
-                    th->serial, next_th->serial
+                debug_threads(stderr, "co_start after call_thread_start_func_2 for th:%d next_th:%d r:%d switching to next ractor, but ENQ first!!!\n",
+                    th->serial, next_th->serial, rb_ractor_id(next_th->ractor)
                 );
                 ractor_sched_enq(next_th->vm, next_th->ractor, true);
             } else {

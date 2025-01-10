@@ -5,6 +5,7 @@
 #include "id_table.h"
 #include "vm_debug.h"
 
+#define RACTOR_CHECK_MODE 0
 #ifndef RACTOR_CHECK_MODE
 #define RACTOR_CHECK_MODE (VM_CHECK_MODE || RUBY_DEBUG) && (SIZEOF_UINT64_T == SIZEOF_VALUE)
 #endif
@@ -93,6 +94,7 @@ enum rb_ractor_wakeup_status {
     wakeup_by_yield,
     wakeup_by_take,
     wakeup_by_close,
+    wakeup_by_timeout,
     wakeup_by_interrupt,
     wakeup_by_retry,
 };
@@ -120,6 +122,7 @@ struct rb_ractor_sync {
         enum rb_ractor_wait_status status;
         enum rb_ractor_wakeup_status wakeup_status;
         rb_thread_t *waiting_thread;
+        unsigned long timeout_ms;
     } wait;
 
 #ifndef RUBY_THREAD_PTHREAD_H

@@ -6657,7 +6657,9 @@ gc_enter(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_
       case gc_enter_event_start:
       case gc_enter_event_continue:
         // stop other ractors
-        rb_gc_vm_barrier();
+        debug_threads(stderr, "gc_enter: rb_gc_vm_barrier\n");
+        //rb_gc_vm_barrier();
+        debug_threads(stderr, "gc_enter: /rb_gc_vm_barrier\n");
         break;
       default:
         break;
@@ -6687,6 +6689,7 @@ gc_exit(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_l
     gc_report(1, objspace, "gc_exit: %s [%s]\n", gc_enter_event_cstr(event), gc_current_status(objspace));
     during_gc = FALSE;
 
+    debug_threads(stderr, "gc_exit\n");
     rb_gc_vm_unlock(*lock_lev);
 }
 

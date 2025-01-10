@@ -112,7 +112,7 @@ struct rb_native_thread {
 
     struct coroutine_context *nt_context;
     int dedicated; // snts can have dedicated > 0 if they are locked to a thread, waiting for it to be ready
-    bool is_dnt;
+    bool is_permanent_dnt;
 
     size_t machine_stack_maxsize;
 };
@@ -122,9 +122,10 @@ struct rb_native_thread {
 #undef leave
 #undef finally
 
-// per-Ractor
+// per-Ractor thread scheduling
 struct rb_thread_sched {
     rb_nativethread_lock_t lock_;
+    bool locked;
 #if VM_CHECK_MODE
     struct rb_thread_struct *lock_owner;
 #endif

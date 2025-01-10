@@ -19,6 +19,7 @@
 #include "variable.h"
 #include "yjit.h"
 #include "rjit.h"
+#include "hrtime.h"
 
 VALUE rb_cRactor;
 static VALUE rb_cRactorSelector;
@@ -623,18 +624,25 @@ ractor_check_ints(rb_execution_context_t *ec, rb_ractor_t *cr, ractor_sleep_clea
 }
 
 #ifdef RUBY_THREAD_PTHREAD_H
-void rb_ractor_sched_sleep(rb_execution_context_t *ec, rb_ractor_t *cr, rb_unblock_function_t *ubf);
+bool rb_ractor_sched_sleep(rb_execution_context_t *ec, rb_ractor_t *cr, rb_unblock_function_t *ubf, unsigned long timeout_ms);
 #else
 
 // win32
 static void
-ractor_cond_wait(rb_ractor_t *r)
+ractor_cond_wait(rb_ractor_t *r, unsigned long timeout_ms)
 {
 #if RACTOR_CHECK_MODE > 0
     VALUE locked_by = r->sync.locked_by;
     r->sync.locked_by = Qnil;
 #endif
-    rb_native_cond_wait(&r->sync.cond, &r->sync.lock);
+    if (timeout_ms > 0) {
+        rb_hrtime_t hrmsec = native_cond_timeout(&r->sync.cond, RB_HRTIME_PER_MSEC * timeout_ms);
+        if (native_cond_timedwait(&r->sync.cond, &r->sync.lock, &hrmsec) == ETIMEDOUT) {
+            r->sync.wait.wakeup_status = wakeup_by_timeout;
+        }
+    } else {
+        rb_native_cond_wait(&r->sync.cond, &r->sync.lock);
+    }
 
 #if RACTOR_CHECK_MODE > 0
     r->sync.locked_by = locked_by;
@@ -649,7 +657,7 @@ ractor_sleep_wo_gvl(void *ptr)
     {
         VM_ASSERT(cr->sync.wait.status != wait_none);
         if (cr->sync.wait.wakeup_status == wakeup_none) {
-            ractor_cond_wait(cr);
+            ractor_cond_wait(cr, cr->sync.wait.timeout_ms);
         }
         cr->sync.wait.status = wait_none;
     }
@@ -657,9 +665,11 @@ ractor_sleep_wo_gvl(void *ptr)
     return NULL;
 }
 
-static void
-rb_ractor_sched_sleep(rb_execution_context_t *ec, rb_ractor_t *cr, rb_unblock_function_t *ubf)
+static bool
+rb_ractor_sched_sleep(rb_execution_context_t *ec, rb_ractor_t *cr, rb_unblock_function_t *ubf, unsigned long timeout_ms)
 {
+    bool timed_out = false;
+    cr->sync.wait.timeout_ms = timeout_ms;
     RACTOR_UNLOCK(cr);
     {
         rb_nogvl(ractor_sleep_wo_gvl, cr,
@@ -667,12 +677,14 @@ rb_ractor_sched_sleep(rb_execution_context_t *ec, rb_ractor_t *cr, rb_unblock_fu
                  RB_NOGVL_UBF_ASYNC_SAFE | RB_NOGVL_INTR_FAIL);
     }
     RACTOR_LOCK(cr);
+    cr->sync.wait.timeout_ms = 0;
+    return timed_out;
 }
 #endif
 
 static enum rb_ractor_wakeup_status
 ractor_sleep_with_cleanup(rb_execution_context_t *ec, rb_ractor_t *cr, enum rb_ractor_wait_status wait_status,
-                          ractor_sleep_cleanup_function cf_func, void *cf_data)
+                          unsigned long timeout_ms, ractor_sleep_cleanup_function cf_func, void *cf_data)
 {
     enum rb_ractor_wakeup_status wakeup_status;
     VM_ASSERT(GET_RACTOR() == cr);
@@ -688,8 +700,31 @@ ractor_sleep_with_cleanup(rb_execution_context_t *ec, rb_ractor_t *cr, enum rb_r
 
     RUBY_DEBUG_LOG("sleep by %s", wait_status_str(wait_status));
 
+    rb_thread_t *th = GET_THREAD();
+    VM_ASSERT(th->nt != NULL);
+    bool check_timeout_each_ready_cycle = false;
+    rb_hrtime_t time_now;
+    rb_hrtime_t time_limit;
+
+    if (timeout_ms > 0) {
+        check_timeout_each_ready_cycle = true;
+        time_now = rb_hrtime_now();
+        time_limit = rb_hrtime_add(time_now, rb_msec2hrtime(timeout_ms));
+    }
+
     while (cr->sync.wait.wakeup_status == wakeup_none) {
-        rb_ractor_sched_sleep(ec, cr, ractor_sleep_interrupt);
+        rb_ractor_sched_sleep(ec, cr, ractor_sleep_interrupt, timeout_ms);
+        if (cr->sync.wait.wakeup_status == wakeup_none && check_timeout_each_ready_cycle) {
+            time_now = rb_hrtime_now();
+            debug_threads(stderr, "ractor_sleep_with_cleanup: checking timeout ready cycle\n");
+            if (time_now > time_limit) {
+                debug_threads(stderr, "ractor_sleep_with_cleanup: timeout OVER\n");
+                cr->sync.wait.wakeup_status = wakeup_by_timeout;
+                break;
+            }
+        } else {
+            debug_threads(stderr, "ractor_sleep_with_cleanup: yielding AGAIN\n");
+        }
         ractor_check_ints(ec, cr, cf_func, cf_data);
     }
 
@@ -707,7 +742,7 @@ ractor_sleep_with_cleanup(rb_execution_context_t *ec, rb_ractor_t *cr, enum rb_r
 static enum rb_ractor_wakeup_status
 ractor_sleep(rb_execution_context_t *ec, rb_ractor_t *cr, enum rb_ractor_wait_status wait_status)
 {
-    return ractor_sleep_with_cleanup(ec, cr, wait_status, 0, NULL);
+    return ractor_sleep_with_cleanup(ec, cr, wait_status, 0, 0, NULL);
 }
 
 // Ractor.receive
@@ -1199,6 +1234,7 @@ ractor_check_specific_take_basket_lock(rb_ractor_t *r, struct rb_ractor_basket *
 static void
 ractor_take_cleanup(rb_ractor_t *cr, rb_ractor_t *r, struct rb_ractor_basket *tb)
 {
+  if (cr->sync.wait.wakeup_status == wakeup_by_timeout) return;
   retry:
     if (basket_none_p(tb)) { // not yielded yet
         if (!ractor_deregister_take(r, tb)) {
@@ -1235,7 +1271,7 @@ ractor_wait_take(rb_execution_context_t *ec, rb_ractor_t *cr, rb_ractor_t *r, st
     RACTOR_LOCK_SELF(cr);
     {
         if (basket_none_p(take_basket) || basket_type_p(take_basket, basket_type_yielding)) {
-            ractor_sleep_with_cleanup(ec, cr, wait_taking, ractor_wait_take_cleanup, &data);
+            ractor_sleep_with_cleanup(ec, cr, wait_taking, 0, ractor_wait_take_cleanup, &data);
         }
     }
     RACTOR_UNLOCK_SELF(cr);
@@ -1653,7 +1689,7 @@ ractor_selector_wait_i(st_data_t key, st_data_t val, st_data_t dat)
 // Ractor::Selector#wait
 
 static void
-ractor_selector_wait_cleaup(rb_ractor_t *cr, void *ptr)
+ractor_selector_wait_cleanup(rb_ractor_t *cr, void *ptr)
 {
     struct rb_ractor_basket *tb = (struct rb_ractor_basket *)ptr;
 
@@ -1667,7 +1703,7 @@ ractor_selector_wait_cleaup(rb_ractor_t *cr, void *ptr)
 }
 
 static VALUE
-ractor_selector__wait(VALUE selv, VALUE do_receivev, VALUE do_yieldv, VALUE yield_value, VALUE move)
+ractor_selector__wait(VALUE selv, VALUE do_receivev, VALUE do_yieldv, VALUE yield_value, VALUE move, VALUE timeout_sec)
 {
     rb_execution_context_t *ec = GET_EC();
     struct rb_ractor_selector *s = RACTOR_SELECTOR_PTR(selv);
@@ -1680,6 +1716,16 @@ ractor_selector__wait(VALUE selv, VALUE do_receivev, VALUE do_yieldv, VALUE yiel
     enum rb_ractor_wait_status wait_status;
     struct rb_ractor_queue *rq = &cr->sync.recv_queue;
     struct rb_ractor_queue *ts = &cr->sync.takers_queue;
+
+    long timeoutl_ms = 0;
+    if (timeout_sec != Qnil) {
+        long timeoutl_sec = NUM2LONG(timeout_sec);
+        if (timeoutl_sec < 0 || (timeoutl_sec * 1000) < 0 || ((unsigned long)timeoutl_sec * 1000) > ULONG_MAX) {
+            timeoutl_ms = 0;
+        } else {
+            timeoutl_ms = timeoutl_sec * 1000;
+        }
+    }
 
     RUBY_DEBUG_LOG("start");
 
@@ -1716,6 +1762,7 @@ ractor_selector__wait(VALUE selv, VALUE do_receivev, VALUE do_yieldv, VALUE yiel
     s->take_basket.type.e = basket_type_none;
     // kick all take target ractors
     st_foreach(s->take_ractors, ractor_selector_wait_i, (st_data_t)tb);
+    bool timed_out = false;
 
     RACTOR_LOCK_SELF(cr);
     {
@@ -1735,62 +1782,73 @@ ractor_selector__wait(VALUE selv, VALUE do_receivev, VALUE do_yieldv, VALUE yiel
                 break;
             }
 
-            ractor_sleep_with_cleanup(ec, cr, wait_status, ractor_selector_wait_cleaup, tb);
+            enum rb_ractor_wakeup_status wakeup_status = ractor_sleep_with_cleanup(ec, cr, wait_status, (unsigned long)timeoutl_ms, ractor_selector_wait_cleanup, tb);
+            if (wakeup_status == wakeup_by_timeout) {
+                timed_out = true;
+                break;
+            }
         }
 
-        taken_basket = *tb;
+        if (!timed_out) {
+            taken_basket = *tb;
 
-        // ensure
-        //   tb->type.e = basket_type_reserved # do it atomic in the following code
-        if (taken_basket.type.e == basket_type_yielding ||
-            RUBY_ATOMIC_CAS(tb->type.atomic, taken_basket.type.e, basket_type_reserved) != taken_basket.type.e) {
+            // ensure
+            //   tb->type.e = basket_type_reserved # do it atomic in the following code
+            if (taken_basket.type.e == basket_type_yielding ||
+                RUBY_ATOMIC_CAS(tb->type.atomic, taken_basket.type.e, basket_type_reserved) != taken_basket.type.e) {
 
-            if (basket_type_p(tb, basket_type_yielding)) {
-                RACTOR_UNLOCK_SELF(cr);
-                {
-                    rb_thread_sleep(0);
+                if (basket_type_p(tb, basket_type_yielding)) {
+                    RACTOR_UNLOCK_SELF(cr);
+                    {
+                        rb_thread_sleep(0);
+                    }
+                    RACTOR_LOCK_SELF(cr);
                 }
-                RACTOR_LOCK_SELF(cr);
+                goto retry_waiting;
             }
-            goto retry_waiting;
         }
     }
     RACTOR_UNLOCK_SELF(cr);
 
-    // check the taken resutl
-    switch (taken_basket.type.e) {
-      case basket_type_none:
-        VM_ASSERT(do_receive || do_yield);
-        goto retry;
-      case basket_type_yielding:
-        rb_bug("unreachable");
-      case basket_type_deleted: {
-          ractor_selector_remove(selv, taken_basket.sender);
+    if (!timed_out) {
+        // check the taken result
+        switch (taken_basket.type.e) {
+        case basket_type_none:
+            VM_ASSERT(do_receive || do_yield);
+            goto retry;
+        case basket_type_yielding:
+            rb_bug("unreachable");
+        case basket_type_deleted: {
+            ractor_selector_remove(selv, taken_basket.sender);
 
-          rb_ractor_t *r = RACTOR_PTR(taken_basket.sender);
-          if (ractor_take_will_lock(r, &taken_basket)) {
-              RUBY_DEBUG_LOG("has_will");
-          }
-          else {
-              RUBY_DEBUG_LOG("no will");
-              // rb_raise(rb_eRactorClosedError, "The outgoing-port is already closed");
-              // remove and retry wait
-              goto retry;
-          }
-          break;
-      }
-      case basket_type_will:
-        // no more messages
-        ractor_selector_remove(selv, taken_basket.sender);
-        break;
-      default:
-        break;
+            rb_ractor_t *r = RACTOR_PTR(taken_basket.sender);
+            if (ractor_take_will_lock(r, &taken_basket)) {
+                RUBY_DEBUG_LOG("has_will");
+            }
+            else {
+                RUBY_DEBUG_LOG("no will");
+                // rb_raise(rb_eRactorClosedError, "The outgoing-port is already closed");
+                // remove and retry wait
+                goto retry;
+            }
+            break;
+        }
+        case basket_type_will:
+            // no more messages
+            ractor_selector_remove(selv, taken_basket.sender);
+            break;
+        default:
+            break;
+        }
+
+        RUBY_DEBUG_LOG("taken_basket:%s", basket_type_name(taken_basket.type.e));
+
+        ret_v = ractor_basket_accept(&taken_basket);
+        ret_r = taken_basket.sender;
+    } else {
+        ret_v = Qnil;
+        ret_r = Qnil;
     }
-
-    RUBY_DEBUG_LOG("taken_basket:%s", basket_type_name(taken_basket.type.e));
-
-    ret_v = ractor_basket_accept(&taken_basket);
-    ret_r = taken_basket.sender;
   success:
     return rb_ary_new_from_args(2, ret_r, ret_v);
 }
@@ -1799,18 +1857,19 @@ static VALUE
 ractor_selector_wait(int argc, VALUE *argv, VALUE selector)
 {
     VALUE options;
-    ID keywords[3];
-    VALUE values[3];
+    ID keywords[4];
+    VALUE values[4];
 
     keywords[0] = rb_intern("receive");
     keywords[1] = rb_intern("yield_value");
     keywords[2] = rb_intern("move");
+    keywords[3] = rb_intern("timeout");
 
     rb_scan_args(argc, argv, "0:", &options);
     rb_get_kwargs(options, keywords, 0, numberof(values), values);
     return ractor_selector__wait(selector,
                                  values[0] == Qundef ? Qfalse : RTEST(values[0]),
-                                 values[1] != Qundef, values[1], values[2]);
+                                 values[1] != Qundef, values[1], values[2], values[3]);
 }
 
 static VALUE
@@ -1826,7 +1885,7 @@ ractor_selector_new(int argc, VALUE *ractors, VALUE klass)
 }
 
 static VALUE
-ractor_select_internal(rb_execution_context_t *ec, VALUE self, VALUE ractors, VALUE do_receive, VALUE do_yield, VALUE yield_value, VALUE move)
+ractor_select_internal(rb_execution_context_t *ec, VALUE self, VALUE ractors, VALUE do_receive, VALUE do_yield, VALUE yield_value, VALUE move, VALUE timeout)
 {
     VALUE selector = ractor_selector_new(RARRAY_LENINT(ractors), (VALUE *)RARRAY_CONST_PTR(ractors), rb_cRactorSelector);
     VALUE result;
@@ -1834,7 +1893,7 @@ ractor_select_internal(rb_execution_context_t *ec, VALUE self, VALUE ractors, VA
 
     EC_PUSH_TAG(ec);
     if ((state = EC_EXEC_TAG()) == TAG_NONE) {
-        result = ractor_selector__wait(selector, do_receive, do_yield, yield_value, move);
+        result = ractor_selector__wait(selector, do_receive, do_yield, yield_value, move, timeout);
     }
     EC_POP_TAG();
     if (state != TAG_NONE) {
@@ -2596,7 +2655,7 @@ rb_init_ractor_selector(void)
     rb_define_method(rb_cRactorSelector, "clear", ractor_selector_clear, 0);
     rb_define_method(rb_cRactorSelector, "empty?", ractor_selector_empty_p, 0);
     rb_define_method(rb_cRactorSelector, "wait", ractor_selector_wait, -1);
-    rb_define_method(rb_cRactorSelector, "_wait", ractor_selector__wait, 4);
+    rb_define_method(rb_cRactorSelector, "_wait", ractor_selector__wait, 5);
 }
 
 /*

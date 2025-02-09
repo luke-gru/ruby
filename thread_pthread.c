@@ -1311,7 +1311,7 @@ void rb_ractor_unlock_self(rb_ractor_t *r);
 
 // current thread for a ractor put to sleep waiting for ractor action
 void
-rb_ractor_sched_sleep(rb_execution_context_t *ec, rb_ractor_t *cr, rb_unblock_function_t *ubf)
+rb_ractor_sched_sleep(rb_execution_context_t *ec, rb_ractor_t *cr, struct rb_ractor_channel *ch, rb_unblock_function_t *ubf)
 {
     // ractor lock of cr is acquired
     // r is sleeping status
@@ -1326,6 +1326,7 @@ rb_ractor_sched_sleep(rb_execution_context_t *ec, rb_ractor_t *cr, rb_unblock_fu
     thread_sched_lock(sched, th);
     {
         rb_ractor_unlock_self(cr);
+        if (ch) rb_ractor_channel_unlock(ch, cr);
         {
             if (RUBY_VM_INTERRUPTED(th->ec)) {
                 RUBY_DEBUG_LOG("interrupted");
@@ -1352,6 +1353,7 @@ rb_ractor_sched_sleep(rb_execution_context_t *ec, rb_ractor_t *cr, rb_unblock_fu
 
     setup_ubf(th, NULL, NULL);
 
+    if (ch) rb_ractor_channel_lock(ch, cr);
     rb_ractor_lock_self(cr);
     ccan_list_del_init(waitn);
 }

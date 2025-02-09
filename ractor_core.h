@@ -75,9 +75,9 @@ struct rb_ractor_queue {
     struct rb_ractor_basket *baskets;
     int start;
     int cnt;
-    int size;
+    int size; // capacity
     unsigned int serial;
-    unsigned int reserved_cnt;
+    unsigned int reserved_cnt; // for receive_if
 };
 
 enum rb_ractor_wait_status {
@@ -86,6 +86,8 @@ enum rb_ractor_wait_status {
     wait_taking    = 0x02,
     wait_yielding  = 0x04,
     wait_moving    = 0x08,
+    wait_receiving_channel = 0x10,
+    wait_sending_channel   = 0x20,
 };
 
 enum rb_ractor_wakeup_status {
@@ -186,6 +188,22 @@ struct rb_ractor_struct {
     void *newobj_cache;
 }; // rb_ractor_t is defined in vm_core.h
 
+struct rb_ractor_channel {
+    int queue_sz; // 0 is unlimited
+    struct rb_ractor_queue send_queue;
+    struct rb_ractor_queue recv_queue;
+    struct {
+        rb_nativethread_lock_t lock;
+#if RACTOR_CHECK_MODE > 0
+        struct rb_ractor_struct *locked_by;
+#endif
+    } sync;
+    /* Sends that haven't been received. This is needed because not all sends
+       use the send_queue, and `ch.close` needs to know how many sends haven't
+       been received yet */
+    int outstanding_sends;
+    bool closed;
+};
 
 static inline VALUE
 rb_ractor_self(const rb_ractor_t *r)
@@ -220,6 +238,9 @@ bool rb_ractor_main_p_(void);
 void rb_ractor_atfork(rb_vm_t *vm, rb_thread_t *th);
 VALUE rb_ractor_require(VALUE feature);
 VALUE rb_ractor_autoload_load(VALUE space, ID id);
+
+void rb_ractor_channel_lock(struct rb_ractor_channel *ch, rb_ractor_t *r);
+void rb_ractor_channel_unlock(struct rb_ractor_channel *ch, rb_ractor_t *r);
 
 VALUE rb_ractor_ensure_shareable(VALUE obj, VALUE name);
 

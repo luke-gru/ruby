@@ -1996,3 +1996,44 @@ vals = t1.value + t2.value
   vals.last(10).count { |v| v == "t2" } == 10
 ]
 }
+
+# Ractor channels
+
+# unlimited buffer channels
+assert_equal 'true', %q{
+chan = Ractor::Channel.new
+
+rs = 10.times.map do
+  Ractor.new(chan) do |c|
+    ret = []
+    loop do
+      obj, _closed = c.receive
+      if obj
+        ret << obj
+      else
+        break
+      end
+    end
+    ret
+  end
+end
+
+50.times do |i|
+  chan.send(i)
+end
+chan.close
+
+vals = []
+while rs.any?
+  r, ret = Ractor.select(*rs)
+  vals.concat ret
+  rs.delete(r)
+end
+
+vals.sort == (0...50).to_a
+}
+
+
+
+
+

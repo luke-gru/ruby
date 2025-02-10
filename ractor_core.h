@@ -98,6 +98,7 @@ enum rb_ractor_wakeup_status {
     wakeup_by_close,
     wakeup_by_interrupt,
     wakeup_by_retry,
+    wakeup_by_channel_receive,
 };
 
 struct rb_ractor_sync {
@@ -198,6 +199,7 @@ struct rb_ractor_channel {
         struct rb_ractor_struct *locked_by;
 #endif
     } sync;
+    struct ccan_list_head blocked_senders; // list of rb_thread_t * blocked due to buffered channel
     /* Sends that haven't been received. This is needed because not all sends
        use the send_queue, and `ch.close` needs to know how many sends haven't
        been received yet */

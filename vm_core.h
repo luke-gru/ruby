@@ -1111,6 +1111,7 @@ struct rb_thread_ractor_waiting {
     //enum rb_ractor_wakeup_status wakeup_status;
     int wakeup_status;
     struct ccan_list_node waiting_node; // the rb_thread_t
+    struct ccan_list_node waiting_ch_node; // the rb_thread_t
     VALUE receiving_mutex;
 #ifndef RUBY_THREAD_PTHREAD_H
     rb_nativethread_cond_t cond;

@@ -3672,6 +3672,7 @@ th_init(rb_thread_t *th, VALUE self, rb_vm_t *vm)
 
     ccan_list_head_init(&th->interrupt_exec_tasks);
     ccan_list_node_init(&th->ractor_waiting.waiting_node);
+    ccan_list_node_init(&th->ractor_waiting.waiting_ch_node);
 #ifndef RUBY_THREAD_PTHREAD_H
     rb_native_cond_initialize(&th->ractor_waiting.cond);
 #endif

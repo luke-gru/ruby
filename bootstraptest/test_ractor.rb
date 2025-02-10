@@ -1998,8 +1998,18 @@ vals = t1.value + t2.value
 }
 
 # Ractor channels
+# ===============
 
-# unlimited buffer channels
+# Basics of channels
+assert_equal 'true', %q{
+  chan = Ractor::Channel.new
+  values = []
+  values << Ractor.shareable?(chan)
+  values << chan.frozen?
+  values.all? { |v| v == true } || values
+}
+
+# channel with unlimited buffer size never blocks during send
 assert_equal 'true', %q{
 chan = Ractor::Channel.new
 
@@ -2018,8 +2028,9 @@ rs = 10.times.map do
   end
 end
 
+blockings = []
 50.times do |i|
-  chan.send(i)
+  blockings << chan.send(i) # should never block
 end
 chan.close
 
@@ -2030,10 +2041,76 @@ while rs.any?
   rs.delete(r)
 end
 
-vals.sort == (0...50).to_a
+(vals.sort == (0...50).to_a && blockings == [false] * 50) ||
+ vals.sort.to_s + " ," + blockings.to_s
 }
 
+# channels with buffer size of 1 block during send until receiver wakes them
+assert_equal 'true', %q{
+chan = Ractor::Channel.new(1)
 
+r = Ractor.new(chan) do |c|
+  loop do
+    i, closed = c.receive
+    break if closed
+  end
+end
 
+blockings = []
+10.times do |i|
+  blockings << chan.send(i) # should always block
+end
+chan.close
+r.take
 
+expected = [true] * 10
+blockings == expected || blockings
+}
 
+# channels are bidirectional
+assert_equal 'true', %q{
+chan = Ractor::Channel.new(1)
+
+r = Ractor.new(chan) do |c|
+  vals = []
+  loop do
+    i, closed = c.receive
+    break if closed
+    vals << i
+    c.send(i*10)
+  end
+  vals
+end
+
+values = []
+10.times do |i|
+  chan.send(i)
+  j, closed = chan.receive
+  break if closed
+  values << j
+end
+chan.close
+vals = r.take
+
+expected_vals = (0...10).to_a
+expected_values = expected_vals.map { |i| i * 10 }
+
+(expected_vals == vals && expected_values == values) ||
+ vals.to_s + ", " + values.to_s
+}
+
+# ractors cannot receive messages from channels that were sent from their own ractor
+assert_equal 'true', %q{
+chan = Ractor::Channel.new
+chan.send(1) # non-blocking
+r = Ractor.new(chan) do |c|
+  sleep 0.5
+  c.send(2)
+  obj, _ = c.receive
+  obj
+end
+# we have to wait until the other ractor sends to the channel
+obj, closed = chan.receive
+obj_from_r = r.take
+obj == 2 && obj_from_r == 1 || obj.to_s + ", " + obj_from_r.to_s
+}

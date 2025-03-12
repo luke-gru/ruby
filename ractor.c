@@ -4337,7 +4337,68 @@ rb_ractor_autoload_load(VALUE module, ID name)
     }
 }
 
-// Ractor channels
+/*
+*
+* Ractor channels
+*
+* Ractor channels are objects that can be passed freely between ractors. Ractors can use them to
+* send data to other ractors, to receive data from other ractors, or both.
+*
+* Channels can be either buffered or unbuffered. A buffered channel takes an integer as an argument
+* to `Ractor::Channel.new`, which is its buffer capacity. No argument given means an unlimited buffer
+* capacity, aka unbuffered.
+*
+* Sending data to channels:
+*
+*  Calling `send` on a channel will sometimes fill a buffer slot and increment the buffer count, and other times
+*  will block until there is room to put more data in the buffer. This depends on the buffer capacity of the channel
+*  and how full the buffer is (the buffer count), which is explained below.
+*
+* Receiving data from channels:
+*
+*   Calling `receive` on a channel will always block if the channel's buffer is empty (its count is zero).
+*   If the buffer count is non-zero, it will not block and will get the data immediately.
+*
+* Buffered channels:
+*
+*   Newly created channels always start out with a buffer count of 0. If a ractor sends data to the channel,
+*   it will increment the buffer count to 1. If another ractor calls `receive` on this channel, it will get
+*   get the data immediately (not block) and decrement the buffer count back to 0.
+*
+*   If a channel has a buffer capacity of 1 and its count is currently 1 (1 data object in it), then
+*   a ractor that sends to the channel will be blocked until another ractor calls `receive` on the
+*   channel, decrementing the count back to 0.
+*
+*   A channel can have a larger buffer capacity, for example 20, and if the buffer count is 20, a ractor
+*   calling `send` will block on it until another ractor calls `receive`.
+*
+* Unbuffered channels:
+*
+*  An unbuffered channel means that a ractor can keep calling `send` on it and never block. This
+*  can fill up the channel's internal memory buffer quickly, so it wouldn't be wise to call `send` too many
+*  times as this will cause memory growth of the channel object. Calling `receive` on a channel will block
+*  if the buffer count is 0 regardless of whether it has unlimited capacity.
+*
+* Closing channels:
+*
+*   Closing a channel means that ractors can't send more data to it. However, it doesn't mean that ractors can't
+*   receive from it. When receiving from a channel, it returns two values: the object sent and the closed status.
+*
+*     `obj, closed = ch.receive`
+*
+*   if `closed` is true, that means a ractor has called `close` on it and there is no more
+*   data in the channel. In that case, ractors can no longer send or receive from this channel. If, however,
+*   there was data in the channel's buffer, then the ractor calling `receive` will get this data and `closed`
+*   will be false. Essentially, closing a channel means "I am done sending to it, let the receiving ractor(s)
+*   call `receive` until the buffer is empty, and then the lifecycle of that channel is over".
+*
+* Channel bidirectionality
+*
+*   Channels allow bidirectional (two-way) communication between ractors. Ractor `A` can call `send` on
+*   a channel and also `receive` on this same channel. However, a ractor will never receive data
+*   that it sent to the channel, only data that other ractors have sent to it.
+*
+*/
 
 static void
 ractor_channel_mark(void *ptr)
@@ -4398,7 +4459,7 @@ ractor_real_channel_new(int argc, VALUE *argv, VALUE klass)
         ch->queue_sz = 0; // "unlimited" buffer size
     }
     if (ch->queue_sz >= 0 && ch->queue_sz >= 2) {
-        ractor_queue_setup(&ch->send_queue, 2); // 2 is starting capacity for unlimited also
+        ractor_queue_setup(&ch->send_queue, 2); // 2 is starting capacity for unlimited, and for size > 2
         ractor_queue_setup(&ch->recv_queue, 2);
     } else {
         ractor_queue_setup(&ch->send_queue, 1);
@@ -4501,6 +4562,7 @@ ractor_channel_wakeup_blocked_sender(struct rb_ractor_channel *ch, rb_ractor_t *
     RACTOR_UNLOCK(r);
 }
 
+// channel is locked
 static void
 ractor_channel_wakeup_receiver(struct rb_ractor_channel *ch, rb_ractor_t *cr, struct rb_ractor_basket *send_b, enum rb_ractor_wait_status wait_status)
 {
@@ -4543,6 +4605,7 @@ ractor_real_channel_send(VALUE selv, VALUE obj)
     bool did_block = false;
     ractor_channel_lock(ch, cr);
     {
+    try_again:
         if (ch->closed) {
             ractor_channel_unlock(ch, cr);
             // TODO: add channel object to ivar @channel of error object and add reader method
@@ -4562,30 +4625,27 @@ ractor_real_channel_send(VALUE selv, VALUE obj)
                 RUBY_DEBUG_LOG("ch enqueue basket");
                 ractor_queue_enq(NULL, &ch->send_queue, &basket, true);
             }
-            // buffered and buffer is full, block until receiver wakes us
-            if (sz != 0 && sz == ch->outstanding_sends) {
-                enum rb_ractor_wakeup_status wakeup_status;
-                RACTOR_LOCK_SELF(cr);
-                {
-                    RUBY_DEBUG_LOG("ch wait_sending, buffer full");
-                    wakeup_status = ractor_channel_wait_sending(ec, cr, cur_th, ch);
-                    if (wakeup_status == wakeup_by_close) {
-                        RUBY_DEBUG_LOG("ch wakeup by close");
-                    }
-                }
-                VM_ASSERT(wakeup_status == wakeup_by_channel_receive ||
-                          wakeup_status == wakeup_by_close);
-                RACTOR_UNLOCK_SELF(cr);
-                did_block = true;
-            } else if (sz != 0) {
-                VM_ASSERT(sz > ch->outstanding_sends); // if buffered, buffer should be larger
-            }
         } else {
-            rb_bug("unreachable");
+            // buffered and buffer is full, block until receiver wakes us
+            VM_ASSERT(sz != 0 && sz == ch->outstanding_sends);
+            enum rb_ractor_wakeup_status wakeup_status;
+            RACTOR_LOCK_SELF(cr);
+            {
+                RUBY_DEBUG_LOG("ch wait_sending, buffer full");
+                wakeup_status = ractor_channel_wait_sending(ec, cr, cur_th, ch);
+                if (wakeup_status == wakeup_by_close) {
+                    RUBY_DEBUG_LOG("ch wakeup by close");
+                }
+            }
+            VM_ASSERT(wakeup_status == wakeup_by_channel_receive ||
+                      wakeup_status == wakeup_by_close);
+            RACTOR_UNLOCK_SELF(cr);
+            did_block = true;
+            goto try_again;
         }
     }
     ractor_channel_unlock(ch, cr);
-    return did_block ? Qtrue : Qfalse;
+    return did_block ? Qtrue : Qfalse; // TODO: this return value is just to ease testing right now
 }
 
 // cleanup function
@@ -4613,6 +4673,7 @@ ractor_channel_wait_receive(rb_execution_context_t *ec, rb_ractor_t *cr, rb_thre
 
 static void ractor_channel_wakeup_stuck_receivers(struct rb_ractor_channel *ch, rb_ractor_t *cr);
 
+// channel must be locked
 static int ractor_channel_blocked_senders_num(struct rb_ractor_channel *ch)
 {
     if (ccan_list_empty(&ch->blocked_senders)) {
@@ -4620,6 +4681,7 @@ static int ractor_channel_blocked_senders_num(struct rb_ractor_channel *ch)
     }
     rb_thread_t *th;
     int count = 0;
+    // TODO: maybe this number should be saved on the channel object itself
     ccan_list_for_each(&ch->blocked_senders, th, ractor_waiting.waiting_ch_node) {
         count++;
     }
@@ -4656,6 +4718,7 @@ ractor_real_channel_receive(VALUE selv)
             val = ractor_basket_value(basket);
             basket->type.e = basket_type_deleted;
             // NOTE: ch->send_queue.cnt isn't always decremented during compact. It depends if it was the head element
+            // TODO: check if this is okay, and if bidirectionality is messing up queue
             ractor_queue_compact(NULL, &ch->send_queue);
             VM_ASSERT(ch->outstanding_sends > 0);
             ch->outstanding_sends--;
@@ -4688,7 +4751,8 @@ ractor_real_channel_receive(VALUE selv)
                 {
                     while (basket_type_p(&payload_basket, basket_type_none)) {
                         RUBY_DEBUG_LOG("ch wait_receive, sleeping");
-                        wakeup_status = ractor_channel_wait_receive(ec, cr, cur_th, ch, &b);
+                        wakeup_status = ractor_channel_wait_receive(ec, cr, cur_th, ch, &b); // ch unlocked
+                        // ch relocked
                         if (wakeup_status == wakeup_by_close) {
                             RUBY_DEBUG_LOG("ch wakeup by channel close");
                             break;
@@ -4729,6 +4793,7 @@ ractor_real_channel_receive(VALUE selv)
     return ret;
 }
 
+/* When a channel is closed, all ractors that are waiting on the receive need to be woken up if the buffer is empty */
 static void
 ractor_channel_wakeup_stuck_receivers(struct rb_ractor_channel *ch, rb_ractor_t *cr)
 {
@@ -4752,9 +4817,6 @@ ractor_channel_wakeup_stuck_receivers(struct rb_ractor_channel *ch, rb_ractor_t 
             }
         }
         RACTOR_UNLOCK(r);
-        // Not sure if this is a good idea, it give them a chance to wake up right away
-        ractor_channel_unlock(ch, cr);
-        ractor_channel_lock(ch, cr);
     }
 }
 

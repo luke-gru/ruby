@@ -98,36 +98,54 @@ rb_hook_list_free(rb_hook_list_t *hooks)
 void rb_clear_attr_ccs(void);
 void rb_clear_bf_ccs(void);
 
-static void
-update_global_event_hook(rb_event_flag_t prev_events, rb_event_flag_t new_events)
+static bool iseq_trace_set_all_needed(rb_event_flag_t prev_events, rb_event_flag_t new_events)
 {
     rb_event_flag_t new_iseq_events = new_events & ISEQ_TRACE_EVENTS;
     rb_event_flag_t enabled_iseq_events = ruby_vm_event_enabled_global_flags & ISEQ_TRACE_EVENTS;
     bool first_time_iseq_events_p = new_iseq_events & ~enabled_iseq_events;
+    return first_time_iseq_events_p;
+
+}
+
+/* if c_call or c_return is activated */
+static bool clear_ccs_needed(rb_event_flag_t prev_events, rb_event_flag_t new_events)
+{
     bool enable_c_call   = (prev_events & RUBY_EVENT_C_CALL)   == 0 && (new_events & RUBY_EVENT_C_CALL);
     bool enable_c_return = (prev_events & RUBY_EVENT_C_RETURN) == 0 && (new_events & RUBY_EVENT_C_RETURN);
-    bool enable_call     = (prev_events & RUBY_EVENT_CALL)     == 0 && (new_events & RUBY_EVENT_CALL);
-    bool enable_return   = (prev_events & RUBY_EVENT_RETURN)   == 0 && (new_events & RUBY_EVENT_RETURN);
+    return enable_c_call || enable_c_return;
+}
+
+/* If the events are internal events (e.g. gc hooks), it updates them globally for all ractors. Otherwise
+ * they are ractor local. You cannot listen to internal events through set_trace_func or TracePoint.
+ */
+static void
+update_global_event_hooks(rb_hook_list_t *list, rb_event_flag_t prev_events, rb_event_flag_t new_events)
+{
+    rb_event_flag_t new_iseq_events = new_events & ISEQ_TRACE_EVENTS;
+    rb_event_flag_t enabled_iseq_events = ruby_vm_event_enabled_global_flags & ISEQ_TRACE_EVENTS;
+    bool first_time_iseq_events_p = iseq_trace_set_all_needed(prev_events, new_events);
+    bool clear_ccs = clear_ccs_needed(prev_events, new_events);
 
     // Modify ISEQs or CCs to enable tracing
     if (first_time_iseq_events_p) {
         // write all ISeqs only when new events are added for the first time
         rb_iseq_trace_set_all(new_iseq_events | enabled_iseq_events);
     }
-    // if c_call or c_return is activated
-    else if (enable_c_call || enable_c_return) {
+    else if (clear_ccs) {
         rb_clear_attr_ccs();
     }
     else if (enable_call || enable_return) {
         rb_clear_bf_ccs();
     }
 
-    ruby_vm_event_flags = new_events;
     ruby_vm_event_enabled_global_flags |= new_events;
-    rb_objspace_set_event_hook(new_events);
+    if (new_events & RUBY_INTERNAL_EVENT_MASK) {
+        ruby_vm_event_flags |= new_events;
+        rb_objspace_set_event_hook(new_events);
+    }
 
     // Invalidate JIT code as needed
-    if (first_time_iseq_events_p || enable_c_call || enable_c_return) {
+    if (first_time_iseq_events_p || clear_ccs) {
         // Invalidate all code when ISEQs are modified to use trace_* insns above.
         // Also invalidate when enabling c_call or c_return because generated code
         // never fires these events.
@@ -171,8 +189,7 @@ hook_list_connect(VALUE list_owner, rb_hook_list_t *list, rb_event_hook_t *hook,
     list->events |= hook->events;
 
     if (global_p) {
-        /* global hooks are root objects at GC mark. */
-        update_global_event_hook(prev_events, list->events);
+        update_global_event_hooks(list, prev_events, list->events);
     }
     else {
         RB_OBJ_WRITTEN(list_owner, Qundef, hook->data);
@@ -180,10 +197,10 @@ hook_list_connect(VALUE list_owner, rb_hook_list_t *list, rb_event_hook_t *hook,
 }
 
 static void
-connect_event_hook(const rb_execution_context_t *ec, rb_event_hook_t *hook)
+connect_event_hook(const rb_execution_context_t *ec, rb_event_hook_t *hook, int global_p)
 {
     rb_hook_list_t *list = rb_ec_ractor_hooks(ec);
-    hook_list_connect(Qundef, list, hook, TRUE);
+    hook_list_connect(Qundef, list, hook, global_p);
 }
 
 static void
@@ -192,7 +209,7 @@ rb_threadptr_add_event_hook(const rb_execution_context_t *ec, rb_thread_t *th,
 {
     rb_event_hook_t *hook = alloc_event_hook(func, events, data, hook_flags);
     hook->filter.th = th;
-    connect_event_hook(ec, hook);
+    connect_event_hook(ec, hook, TRUE);
 }
 
 void
@@ -217,7 +234,7 @@ void
 rb_add_event_hook2(rb_event_hook_func_t func, rb_event_flag_t events, VALUE data, rb_event_hook_flag_t hook_flags)
 {
     rb_event_hook_t *hook = alloc_event_hook(func, events, data, hook_flags);
-    connect_event_hook(GET_EC(), hook);
+    connect_event_hook(GET_EC(), hook, TRUE);
 }
 
 static void
@@ -250,7 +267,7 @@ clean_hooks(rb_hook_list_t *list)
         }
     }
     else {
-        update_global_event_hook(prev_events, list->events);
+        update_global_event_hooks(list, prev_events, list->events);
     }
 }
 

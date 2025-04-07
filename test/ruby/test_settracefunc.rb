@@ -2957,4 +2957,50 @@ CODE
 
     assert_kind_of(Thread, target_thread)
   end
+
+  def test_tp_ractor_local
+    r = Ractor.new do
+      results = []
+      tp = TracePoint.new(:line) { |tp| results << tp.path }
+      tp.enable
+      msg = receive # block until message
+      tp.disable
+      results
+    end
+    outer_results = []
+    outer_tp = TracePoint.new(:line) { |tp| outer_results << tp.path }
+    outer_tp.enable
+    GC.start # so I can check <internal:gc> path
+    r.send(:continue)
+    results = r.take
+    outer_tp.disable
+    assert_equal 1, outer_results.select { |path| path.match?(/internal:gc/) }.size
+    assert_equal 0, results.select { |path| path.match?(/internal:gc/) }.size
+  end
+
+  def test_tracepoint_not_disabled_by_ractor_gc
+    events = []
+    tracepoint = TracePoint.new(:line) { |tp|
+      events << [tp.path, tp.lineno, tp.event]
+    }.tap(&:enable)
+
+    r = Ractor.new { 10 }
+    r.take
+    ractor_id = r.object_id
+    r = nil # allow gc for ractor
+    gc_times = 0
+    # force GC of ractor
+    until (ObjectSpace._id2ref(ractor_id) rescue nil).nil?
+      GC.start
+      gc_times += 1
+    end # tracepoints should still be enabled after ractor gc
+
+    5.times {
+      # we're checking path of '<internal:gc> calls (GC.start calls)'
+      GC.start
+    }
+    tracepoint.disable
+    gc_times += 5
+    assert_equal gc_times, events.select { |e| e[0] =~ /internal:gc/}.size, "Bug #[19112]"
+  end
 end

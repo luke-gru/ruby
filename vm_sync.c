@@ -20,6 +20,13 @@ RUBY_ASSERT_vm_locking(void)
 {
     if (rb_multi_ractor_p()) {
         rb_vm_t *vm = GET_VM();
+        if (!vm_locked(vm)) {
+            fprintf(stderr, "VM is not locked by ractor:%u", (unsigned int)rb_ractor_id(GET_RACTOR()));
+            if (vm->ractor.sync.lock_owner) {
+                fprintf(stderr, " but by ractor:%u", (unsigned int)rb_ractor_id(vm->ractor.sync.lock_owner));
+            }
+            fprintf(stderr, "\n");
+        }
         VM_ASSERT(vm_locked(vm));
     }
 }

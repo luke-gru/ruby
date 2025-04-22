@@ -4153,4 +4153,25 @@ rb_ractor_autoload_load(VALUE module, ID name)
     }
 }
 
+void
+rb_ractor_stop_other_ractors(void)
+{
+    rb_ractor_t *cr = GET_RACTOR();
+    if (cr == ruby_single_main_ractor || GET_VM()->ractor.sync.lock_owner == cr) {
+        return;
+    }
+    RB_VM_LOCK();
+    rb_vm_barrier();
+}
+
+void
+rb_ractor_continue_other_ractors(void)
+{
+    rb_ractor_t *cr = GET_RACTOR();
+    if (cr == ruby_single_main_ractor || GET_VM()->ractor.sync.lock_owner != cr) {
+        return;
+    }
+    RB_VM_UNLOCK();
+}
+
 #include "ractor.rbinc"

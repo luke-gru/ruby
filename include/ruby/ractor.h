@@ -221,6 +221,9 @@ VALUE rb_ractor_make_shareable(VALUE obj);
  */
 VALUE rb_ractor_make_shareable_copy(VALUE obj);
 
+RUBY_EXTERN void rb_ractor_stop_other_ractors(void);
+RUBY_EXTERN void rb_ractor_continue_other_ractors(void);
+
 RBIMPL_SYMBOL_EXPORT_END()
 
 /**

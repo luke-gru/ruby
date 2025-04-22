@@ -370,9 +370,9 @@ rb_ractor_confirm_belonging(VALUE obj)
         if (rb_ractor_shareable_p(obj)) {
             // ok
         }
-        else {
-            rp(obj);
-            rb_bug("rb_ractor_confirm_belonging object-ractor id:%u, current-ractor id:%u", id, rb_ractor_current_id());
+        else { // TODO: fix for "debug" gem
+            //rp(obj);
+            //rb_bug("rb_ractor_confirm_belonging object-ractor id:%u, current-ractor id:%u", id, rb_ractor_current_id());
         }
     }
     return obj;

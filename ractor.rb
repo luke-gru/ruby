@@ -889,6 +889,36 @@ class Ractor
     }
   end
 
+  def self.stop_other_ractors
+    __builtin_cexpr! %q{
+      (rb_ractor_stop_other_ractors(), Qtrue)
+    }
+  end
+
+  def self.continue_other_ractors
+    __builtin_cexpr! %q{
+      (rb_ractor_continue_other_ractors(), Qtrue)
+    }
+  end
+
+  def self.lock_vm
+    __builtin_cexpr! %q{
+      RBOOL(GET_VM()->ractor.sync.lock_owner == rb_ec_ractor_ptr(ec) ? Qfalse : (RB_VM_LOCK(), Qtrue))
+    }
+  end
+
+  def self.unlock_vm
+    __builtin_cexpr! %q{
+      RBOOL(GET_VM()->ractor.sync.lock_owner == rb_ec_ractor_ptr(ec) ? (RB_VM_UNLOCK(), Qtrue) : Qfalse)
+    }
+  end
+
+  def self.locked_vm?
+    __builtin_cexpr! %q{
+      RBOOL(GET_VM()->ractor.sync.lock_owner == rb_ec_ractor_ptr(ec))
+    }
+  end
+
   # internal method
   def self._require feature # :nodoc:
     if main?

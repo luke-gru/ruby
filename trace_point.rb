@@ -91,9 +91,9 @@ class TracePoint
   #
   # Access from other threads is also forbidden.
   #
-  def self.new(*events)
+  def self.new(*events, global: false)
     Primitive.attr! :use_block
-    Primitive.tracepoint_new_s(events)
+    Primitive.tracepoint_new_s(events, global)
   end
 
   # call-seq:

@@ -3892,7 +3892,7 @@ iseq_add_local_tracepoint(const rb_iseq_t *iseq, rb_event_flag_t turnon_events, 
 
     VM_ASSERT(ISEQ_EXECUTABLE_P(iseq));
 
-    for (pc=0; pc<body->iseq_size;) {
+    for (pc=0; pc < body->iseq_size;) {
         const struct iseq_insn_info_entry *entry = get_insn_info(iseq, pc);
         rb_event_flag_t pc_events = entry->events;
         rb_event_flag_t target_events = turnon_events;
@@ -3954,6 +3954,7 @@ rb_iseq_add_local_tracepoint_recursively(const rb_iseq_t *iseq, rb_event_flag_t 
     return data.n;
 }
 
+/* Must not be called from more than 1 thread at a time */
 static int
 iseq_remove_local_tracepoint(const rb_iseq_t *iseq, VALUE tpval)
 {

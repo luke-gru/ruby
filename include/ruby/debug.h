@@ -821,7 +821,8 @@ int rb_postponed_job_register_one(unsigned int flags, rb_postponed_job_func_t fu
 typedef enum {
     RUBY_EVENT_HOOK_FLAG_SAFE    = 0x01,
     RUBY_EVENT_HOOK_FLAG_DELETED = 0x02,
-    RUBY_EVENT_HOOK_FLAG_RAW_ARG = 0x04
+    RUBY_EVENT_HOOK_FLAG_RAW_ARG = 0x04,
+    RUBY_EVENT_HOOK_RACTOR_GLOBAL = 0x08
 } rb_event_hook_flag_t;
 
 void rb_add_event_hook2(rb_event_hook_func_t func, rb_event_flag_t events, VALUE data, rb_event_hook_flag_t hook_flag);

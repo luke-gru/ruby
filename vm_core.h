@@ -2198,6 +2198,7 @@ rb_ec_ractor_hooks(const rb_execution_context_t *ec)
     return &cr_pub->hooks;
 }
 
+// ex: EXEC_EVENT_HOOK(ec, RUBY_EVENT_C_RETURN, ec->cfp->self, def->original_id, def->called_id, klass, data)
 #define EXEC_EVENT_HOOK(ec_, flag_, self_, id_, called_id_, klass_, data_) \
   EXEC_EVENT_HOOK_ORIG(ec_, rb_ec_ractor_hooks(ec_), flag_, self_, id_, called_id_, klass_, data_, 0)
 

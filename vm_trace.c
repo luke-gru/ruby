@@ -34,6 +34,7 @@
 #include "ruby/debug.h"
 #include "vm_core.h"
 #include "ruby/ractor.h"
+#include "ractor_core.h"
 #include "yjit.h"
 
 #include "builtin.h"
@@ -117,6 +118,7 @@ static bool clear_ccs_needed(rb_event_flag_t prev_events, rb_event_flag_t new_ev
 
 /* If the events are internal events (e.g. gc hooks), it updates them globally for all ractors. Otherwise
  * they are ractor local. You cannot listen to internal events through set_trace_func or TracePoint.
+ * TODO: this is not thread-safe. We need to add a lock around this function.
  */
 static void
 update_global_event_hooks(rb_hook_list_t *list, rb_event_flag_t prev_events, rb_event_flag_t new_events)
@@ -201,8 +203,26 @@ hook_list_connect(VALUE list_owner, rb_hook_list_t *list, rb_event_hook_t *hook,
 static void
 connect_event_hook(const rb_execution_context_t *ec, rb_event_hook_t *hook)
 {
-    rb_hook_list_t *list = rb_ec_ractor_hooks(ec);
-    hook_list_connect(Qundef, list, hook, TRUE);
+    bool ractor_global = (hook->hook_flags & RUBY_EVENT_HOOK_RACTOR_GLOBAL) != 0;
+    // if ractor global, have to stop all ractors to update their hooks
+    if (ractor_global) {
+        /*fprintf(stderr, "global ractor hook (connect_event_hook)\n");*/
+        RB_VM_LOCK_ENTER();
+        {
+            rb_vm_barrier();
+            rb_ractor_t *r = NULL;
+            ccan_list_for_each(&GET_VM()->ractor.set, r, vmlr_node) {
+                if (r->threads.cnt > 0) {
+                    rb_hook_list_t *list = &r->pub.hooks;
+                    hook_list_connect(Qundef, list, hook, TRUE); // TODO: connect same hook or alloc new one?
+                }
+            }
+        }
+        RB_VM_LOCK_LEAVE();
+    } else {
+        rb_hook_list_t *list = rb_ec_ractor_hooks(ec);
+        hook_list_connect(Qundef, list, hook, TRUE);
+    }
 }
 
 static void
@@ -285,28 +305,82 @@ clean_hooks_check(rb_hook_list_t *list)
 
 #define MATCH_ANY_FILTER_TH ((rb_thread_t *)1)
 
+typedef struct rb_tp_struct {
+    rb_event_flag_t events;
+    int tracing; /* bool: whether or not the TracePoint is enabled */
+    rb_thread_t *target_th;
+    VALUE local_target_set; /* Hash: target ->
+                             * Qtrue (if target is iseq) or
+                             * Qfalse (if target is bmethod)
+                             */
+    void (*func)(VALUE tpval, void *data);
+    void *data;
+    VALUE proc;
+    rb_ractor_t *ractor;
+    VALUE self;
+    bool global_p; /* whether or not this TracePoint is ractor-global (default is false) */
+} rb_tp_t;
+
+static rb_tp_t *tpptr(VALUE tpval);
+
 /* if func is 0, then clear all funcs */
 static int
 remove_event_hook(const rb_execution_context_t *ec, const rb_thread_t *filter_th, rb_event_hook_func_t func, VALUE data)
 {
-    rb_hook_list_t *list = rb_ec_ractor_hooks(ec);
     int ret = 0;
-    rb_event_hook_t *hook = list->hooks;
+    struct rb_tp_struct *tp = NULL;
 
-    while (hook) {
-        if (func == 0 || hook->func == func) {
-            if (hook->filter.th == filter_th || filter_th == MATCH_ANY_FILTER_TH) {
-                if (UNDEF_P(data) || hook->data == data) {
-                    hook->hook_flags |= RUBY_EVENT_HOOK_FLAG_DELETED;
-                    ret+=1;
-                    list->need_clean = true;
+    if (data != Qundef) {
+        tp = tpptr(data);
+    }
+
+    // TODO: have a vm->trace_hooks list instead of a hook connected to each ractor-local hook list
+    if (tp && tp->global_p) {
+        /*fprintf(stderr, "try removing global ractor hook(s)\n");*/
+        RB_VM_LOCK_ENTER();
+        {
+            rb_vm_barrier();
+            rb_ractor_t *r = NULL;
+            ccan_list_for_each(&GET_VM()->ractor.set, r, vmlr_node) {
+                if (r->threads.cnt > 0) {
+                    rb_hook_list_t *list = &r->pub.hooks;
+                    rb_event_hook_t *hook = list->hooks;
+                    while (hook) {
+                        if (func == 0 || hook->func == func) {
+                            if (hook->filter.th == filter_th || filter_th == MATCH_ANY_FILTER_TH) {
+                                if (UNDEF_P(data) || hook->data == data) {
+                                    fprintf(stderr, "removing ractor global hook\n");
+                                    hook->hook_flags |= RUBY_EVENT_HOOK_FLAG_DELETED;
+                                    ret+=1;
+                                    list->need_clean = true;
+                                }
+                            }
+                        }
+                        hook = hook->next;
+                    }
+                    clean_hooks_check(list);
                 }
             }
         }
-        hook = hook->next;
+        RB_VM_LOCK_LEAVE();
+    } else {
+        rb_hook_list_t *list = rb_ec_ractor_hooks(ec);
+        rb_event_hook_t *hook = list->hooks;
+        while (hook) {
+            if (func == 0 || hook->func == func) {
+                if (hook->filter.th == filter_th || filter_th == MATCH_ANY_FILTER_TH) {
+                    if (UNDEF_P(data) || hook->data == data) {
+                        hook->hook_flags |= RUBY_EVENT_HOOK_FLAG_DELETED;
+                        ret+=1;
+                        list->need_clean = true;
+                    }
+                }
+            }
+            hook = hook->next;
+        }
+        clean_hooks_check(list);
     }
 
-    clean_hooks_check(list);
     return ret;
 }
 
@@ -322,6 +396,7 @@ rb_thread_remove_event_hook(VALUE thval, rb_event_hook_func_t func)
     return rb_threadptr_remove_event_hook(GET_EC(), rb_thread_ptr(thval), func, Qundef);
 }
 
+// Remove non-method-targeted event hook with data (such as TracePoint). With :target_th, and ractor-local or ractor-global hook.
 int
 rb_thread_remove_event_hook_with_data(VALUE thval, rb_event_hook_func_t func, VALUE data)
 {
@@ -334,6 +409,7 @@ rb_remove_event_hook(rb_event_hook_func_t func)
     return remove_event_hook(GET_EC(), NULL, func, Qundef);
 }
 
+// Remove non-method-targeted event hook with data (such as TracePoint). Without :target_th, and ractor-local or ractor-global hook.
 int
 rb_remove_event_hook_with_data(rb_event_hook_func_t func, VALUE data)
 {
@@ -364,7 +440,7 @@ exec_hooks_body(const rb_execution_context_t *ec, rb_hook_list_t *list, const rb
             (trace_arg->event & hook->events) &&
             (LIKELY(hook->filter.th == 0) || hook->filter.th == rb_ec_thread_ptr(ec)) &&
             (LIKELY(hook->filter.target_line == 0) || (hook->filter.target_line == (unsigned int)rb_vm_get_sourceline(ec->cfp)))) {
-            if (!(hook->hook_flags & RUBY_EVENT_HOOK_FLAG_RAW_ARG)) {
+            if (!(hook->hook_flags & RUBY_EVENT_HOOK_FLAG_RAW_ARG)) { // ex: TracePoint
                 (*hook->func)(trace_arg->event, hook->data, trace_arg->self, trace_arg->id, trace_arg->klass);
             }
             else {
@@ -776,21 +852,6 @@ call_trace_func(rb_event_flag_t event, VALUE proc, VALUE self, ID id, VALUE klas
 
 static VALUE rb_cTracePoint;
 
-typedef struct rb_tp_struct {
-    rb_event_flag_t events;
-    int tracing; /* bool */
-    rb_thread_t *target_th;
-    VALUE local_target_set; /* Hash: target ->
-                             * Qtrue (if target is iseq) or
-                             * Qfalse (if target is bmethod)
-                             */
-    void (*func)(VALUE tpval, void *data);
-    void *data;
-    VALUE proc;
-    rb_ractor_t *ractor;
-    VALUE self;
-} rb_tp_t;
-
 static void
 tp_mark(void *ptr)
 {
@@ -798,6 +859,7 @@ tp_mark(void *ptr)
     rb_gc_mark(tp->proc);
     rb_gc_mark(tp->local_target_set);
     if (tp->target_th) rb_gc_mark(tp->target_th->self);
+    if (tp->ractor) rb_gc_mark(tp->ractor->pub.self);
 }
 
 static const rb_data_type_t tp_data_type = {
@@ -1202,6 +1264,8 @@ tp_call_trace(VALUE tpval, rb_trace_arg_t *trace_arg)
     }
     else {
         if (tp->ractor == NULL || tp->ractor == GET_RACTOR()) {
+            // TODO: not sure if it's safe accessing TP object from multiple ractors at once, might
+            // need a lock. If they're all readonly methods it should be fine though.
             rb_proc_call_with_block((VALUE)tp->proc, 1, &tpval, Qnil);
         }
     }
@@ -1221,13 +1285,16 @@ rb_tracepoint_enable(VALUE tpval)
         return Qundef;
     }
 
+    rb_event_hook_flag_t flags = RUBY_EVENT_HOOK_FLAG_SAFE | RUBY_EVENT_HOOK_FLAG_RAW_ARG;
+    if (tp->global_p) {
+        flags |= RUBY_EVENT_HOOK_RACTOR_GLOBAL;
+    }
+
     if (tp->target_th) {
-        rb_thread_add_event_hook2(tp->target_th->self, (rb_event_hook_func_t)tp_call_trace, tp->events, tpval,
-                                  RUBY_EVENT_HOOK_FLAG_SAFE | RUBY_EVENT_HOOK_FLAG_RAW_ARG);
+        rb_thread_add_event_hook2(tp->target_th->self, (rb_event_hook_func_t)tp_call_trace, tp->events, tpval, flags);
     }
     else {
-        rb_add_event_hook2((rb_event_hook_func_t)tp_call_trace, tp->events, tpval,
-                           RUBY_EVENT_HOOK_FLAG_SAFE | RUBY_EVENT_HOOK_FLAG_RAW_ARG);
+        rb_add_event_hook2((rb_event_hook_func_t)tp_call_trace, tp->events, tpval, flags);
     }
     tp->tracing = 1;
     return Qundef;
@@ -1274,9 +1341,14 @@ rb_tracepoint_enable_for_target(VALUE tpval, VALUE target, VALUE target_line)
 
     /* bmethod */
     if (rb_obj_is_method(target)) {
+        /*fprintf(stderr, "hooking method\n");*/
         rb_method_definition_t *def = (rb_method_definition_t *)rb_method_def(target);
         if (def->type == VM_METHOD_TYPE_BMETHOD &&
                 (tp->events & (RUBY_EVENT_CALL | RUBY_EVENT_RETURN))) {
+            /*fprintf(stderr, "hooking bmethod\n");*/
+            if (tp->global_p) {
+                // raise error here?
+            }
             if (def->body.bmethod.hooks == NULL) {
                 def->body.bmethod.hooks = ZALLOC(rb_hook_list_t);
                 def->body.bmethod.hooks->is_local = true;
@@ -1314,7 +1386,8 @@ rb_tracepoint_enable_for_target(VALUE tpval, VALUE target, VALUE target_line)
 static int
 disable_local_event_iseq_i(VALUE target, VALUE iseq_p, VALUE tpval)
 {
-    if (iseq_p) {
+    if (RTEST(iseq_p)) {
+        // must not be called by 2 ractors at once for same iseq
         rb_iseq_remove_local_tracepoint_recursively((rb_iseq_t *)target, tpval);
     }
     else {
@@ -1339,10 +1412,11 @@ rb_tracepoint_disable(VALUE tpval)
 
     tp = tpptr(tpval);
 
-    if (tp->local_target_set) {
+    // TODO: work for ractor global_p, and make thread-safe in case 2 tracepoints point to same iseq in different ractors
+    if (tp->local_target_set != Qfalse) { // enabaled with target: iseq or bmethod
         rb_hash_foreach(tp->local_target_set, disable_local_event_iseq_i, tpval);
         RB_OBJ_WRITE(tpval, &tp->local_target_set, Qfalse);
-        ruby_vm_event_local_num--;
+        ruby_vm_event_local_num--; // TODO: thread-unsafe, and what does this do?
     }
     else {
         if (tp->target_th) {
@@ -1364,7 +1438,22 @@ rb_hook_list_connect_tracepoint(VALUE target, rb_hook_list_t *list, VALUE tpval,
     rb_event_hook_t *hook = alloc_event_hook((rb_event_hook_func_t)tp_call_trace, tp->events & ISEQ_TRACE_EVENTS, tpval,
                                              RUBY_EVENT_HOOK_FLAG_SAFE | RUBY_EVENT_HOOK_FLAG_RAW_ARG);
     hook->filter.target_line = target_line;
-    hook_list_connect(target, list, hook, FALSE);
+    /*if (tp->global_p) {*/
+        /*fprintf(stderr, "global ractor hook (rb_hook_list_connect_tracepoint)\n");*/
+        /*RB_VM_LOCK_ENTER();*/
+        /*{*/
+            /*rb_vm_barrier();*/
+            /*rb_ractor_t *r = NULL;*/
+            /*ccan_list_for_each(&GET_VM()->ractor.set, r, vmlr_node) {*/
+                /*rb_hook_list_t *list = &r->pub.hooks;*/
+                /*hook_list_connect(target, list, hook, FALSE); // TODO: connect same hook or alloc new one?*/
+            /*}*/
+        /*}*/
+        /*RB_VM_LOCK_LEAVE();*/
+
+    /*} else {*/
+        hook_list_connect(target, list, hook, FALSE);
+    /*}*/
 }
 
 void
@@ -1472,18 +1561,28 @@ tracepoint_enabled_p(rb_execution_context_t *ec, VALUE tpval)
 }
 
 static VALUE
-tracepoint_new(VALUE klass, rb_thread_t *target_th, rb_event_flag_t events, void (func)(VALUE, void*), void *data, VALUE proc)
+tracepoint_new(VALUE klass, rb_thread_t *target_th, rb_event_flag_t events, bool global, void (func)(VALUE, void*), void *data, VALUE proc)
 {
     VALUE tpval = tp_alloc(klass);
     rb_tp_t *tp;
     TypedData_Get_Struct(tpval, rb_tp_t, &tp_data_type, tp);
 
     RB_OBJ_WRITE(tpval, &tp->proc, proc);
-    tp->ractor = rb_ractor_shareable_p(proc) ? NULL : GET_RACTOR();
+    bool proc_shareable_p = rb_ractor_shareable_p(proc);
+    tp->ractor = proc_shareable_p ? NULL : GET_RACTOR();
     tp->func = func;
     tp->data = data;
     tp->events = events;
     tp->self = tpval;
+    tp->global_p = global;
+    if (tp->global_p) {
+        /*fprintf(stderr, "new global TP\n");*/
+        if (!proc_shareable_p) {
+            /*fprintf(stderr, "isolating proc for global TP\n");*/
+            rb_proc_isolate_bang(proc);
+            tp->ractor = NULL;
+        }
+    }
 
     return tpval;
 }
@@ -1499,11 +1598,11 @@ rb_tracepoint_new(VALUE target_thval, rb_event_flag_t events, void (*func)(VALUE
          * Warning: This function is not tested.
          */
     }
-    return tracepoint_new(rb_cTracePoint, target_th, events, func, data, Qundef);
+    return tracepoint_new(rb_cTracePoint, target_th, events, false, func, data, Qundef);
 }
 
 static VALUE
-tracepoint_new_s(rb_execution_context_t *ec, VALUE self, VALUE args)
+tracepoint_new_s(rb_execution_context_t *ec, VALUE self, VALUE args, VALUE global)
 {
     rb_event_flag_t events = 0;
     long i;
@@ -1522,13 +1621,13 @@ tracepoint_new_s(rb_execution_context_t *ec, VALUE self, VALUE args)
         rb_raise(rb_eArgError, "must be called with a block");
     }
 
-    return tracepoint_new(self, 0, events, 0, 0, rb_block_proc());
+    return tracepoint_new(self, 0, events, RTEST(global), 0, 0, rb_block_proc());
 }
 
 static VALUE
 tracepoint_trace_s(rb_execution_context_t *ec, VALUE self, VALUE args)
 {
-    VALUE trace = tracepoint_new_s(ec, self, args);
+    VALUE trace = tracepoint_new_s(ec, self, args, false);
     rb_tracepoint_enable(trace);
     return trace;
 }

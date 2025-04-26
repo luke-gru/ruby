@@ -60,6 +60,7 @@
 #define RUBY_EVENT_SCRIPT_COMPILED   0x2000 /**< Encountered an `eval`. */
 #define RUBY_EVENT_RESCUE            0x4000 /**< Encountered a `rescue` statement. */
 #define RUBY_EVENT_TRACEPOINT_ALL    0xffff /**< Bitmask of extended events. */
+// TODO: maybe add RUBY_EVENT_RACTOR_{BEGIN,END}
 
 /** @} */
 

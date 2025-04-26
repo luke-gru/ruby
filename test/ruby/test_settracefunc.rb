@@ -3042,4 +3042,33 @@ CODE
     assert_equal gc_times, events.select { |e| e[0] =~ /internal:gc/}.size, "Bug #[19112]"
     end;
   end
+
+  def test_tp_is_global_across_ractors_when_given_global_keyword_and_target_method
+    assert_ractor("#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+    def called
+    end
+    Ractor.current[:num_calls] = 0
+    r = Ractor.new do
+      Ractor.current[:num_calls] = 0
+      receive
+      3.times do
+        called()
+      end
+      Ractor.current[:num_calls]
+    end
+    tp = TracePoint.new(:call, global: true) do |tp|
+      Ractor.current[:num_calls] += 1
+    end
+    tp.enable(target: method(:called))
+    3.times do
+      called()
+    end
+    r.send(:continue)
+    ractor_results = r.take
+    tp.disable
+    assert_equal 3, ractor_results
+    assert_equal 3, Ractor.current[:num_calls]
+    end;
+  end
 end

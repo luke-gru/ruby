@@ -8,7 +8,18 @@ class ExampleState
   def initialize(context, it, example = nil)
     @context = context
     @it = it
-    @example = example
+    @example = example # proc
+    if @example
+      $stderr.puts RUBY_DESCRIPTION
+      block_lines = RubyVM::InstructionSequence.of(example).script_lines
+      if block_lines
+        $stderr.puts "block_lines found"
+        exit 1
+        block_lines.unshift "Ractor.new do\n"
+        block_lines << "end.take\n"
+        @example = eval "proc do\n#{block_lines.join}\nend"
+      end
+    end
   end
 
   def context=(context)

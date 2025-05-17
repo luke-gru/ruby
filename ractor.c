@@ -3688,7 +3688,9 @@ move_leave(VALUE obj, struct obj_traverse_replace_data *data)
 static VALUE
 ractor_move(VALUE obj)
 {
+    /*VALUE gc_disabled = rb_gc_disable();*/
     VALUE val = rb_obj_traverse_replace(obj, move_enter, move_leave, true);
+    /*if (gc_disabled == Qfalse) rb_gc_enable();*/
     if (!UNDEF_P(val)) {
         return val;
     }
@@ -4128,6 +4130,7 @@ struct cross_ractor_require {
     ID name;
 };
 
+// called in main ractor
 static VALUE
 require_body(VALUE data)
 {
@@ -4215,6 +4218,9 @@ rb_ractor_require(VALUE feature)
     rb_ractor_channel_close(ec, crr.ch);
 
     if (crr.exception != Qundef) {
+#if RACTOR_CHECK_MODE > 0
+        ractor_reset_belonging(crr.exception);
+#endif
         rb_exc_raise(crr.exception);
     }
     else {

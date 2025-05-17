@@ -3,6 +3,7 @@ require 'mspec/utils/options'
 require 'mspec/utils/script'
 
 
+RubyVM.keep_script_lines = true
 class MSpecRun < MSpecScript
   def initialize
     super
@@ -27,7 +28,10 @@ class MSpecRun < MSpecScript
     options.doc "\n How to modify the execution"
     options.chdir
     options.prefix
-    options.configure { |f| load f }
+    options.configure { |f|
+      $stderr.puts "f: #{f} (#{f.class})"
+      load f
+    }
     options.env
     options.randomize
     options.repeat

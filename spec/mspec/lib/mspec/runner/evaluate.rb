@@ -14,7 +14,7 @@ class SpecEvaluate
     @desc = desc || self.class.desc
   end
 
-  # Formats the Ruby source code for reabable output in the -fs formatter
+  # Formats the Ruby source code for readable output in the -fs formatter
   # option. If the source contains no newline characters, wraps the source in
   # single quotes to set if off from the rest of the description string. If
   # the source does contain newline characters, sets the indent level to four
@@ -41,6 +41,16 @@ class SpecEvaluate
     ruby = @ruby
     desc = @desc
     evaluator = self
+
+    block_lines = RubyVM::InstructionSequence.of(block).script_lines
+    if block_lines
+      block_lines.unshift "Ractor.new do\n"
+      block_lines << "end.take\n"
+      block = eval "proc do\n#{block_lines.join}\nend"
+    end
+    if !ruby.strip.empty?
+      ruby = "Ractor.new do\n#{ruby}\nend.take"
+    end
 
     specify "#{desc} #{format ruby}" do
       evaluator.instance_eval(ruby)

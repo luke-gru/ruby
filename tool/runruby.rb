@@ -15,6 +15,8 @@ when ENV['RUNRUBY_USE_RR'] == 'true'
   debugger = :rr
 when ENV['RUNRUBY_YJIT_STATS']
   use_yjit_stat = true
+when ENV['RUNRUBY_USE_PARSEY']
+  use_parsey = true
 end
 while arg = ARGV[0]
   break ARGV.shift if arg == '--'
@@ -172,6 +174,9 @@ end
 cmd = [runner || ruby]
 if use_yjit_stat
   cmd << '--yjit-stats'
+end
+if use_parsey
+  cmd << '--parser=parse.y'
 end
 cmd.concat(ARGV)
 cmd.unshift(*precommand) unless precommand.empty?

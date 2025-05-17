@@ -66,6 +66,7 @@ p Foo::Bar
   end
 
   def test_autoload_p_with_static_extensions
+    pend "belonging issue" if non_main_ractor?
     require 'rbconfig'
     omit unless RbConfig::CONFIG['EXTSTATIC'] == 'static'
     begin
@@ -397,6 +398,7 @@ p Foo::Bar
   end
 
   def test_autoload_fork
+    pend "deadlock" if non_main_ractor?
     EnvUtil.default_warning do
       Tempfile.create(['autoload', '.rb']) {|file|
         file.puts 'sleep 0.3; class AutoloadTest; end'

@@ -286,7 +286,7 @@ end
 
 def read_make_deps(cwd)
   dependencies = {}
-  make_p, make_p_stderr, make_p_status = Open3.capture3("make -p all miniruby exe/ruby golf")
+  make_p, make_p_stderr, make_p_status = Open3.capture3("make -p --just-print all miniruby exe/ruby golf")
   File.open('update-deps.make.out.log', 'w') {|f| f.print make_p }
   File.open('update-deps.make.err.log', 'w') {|f| f.print make_p_stderr }
   if !make_p_status.success?
@@ -398,18 +398,32 @@ end
 
 def read_cc_deps(cwd)
   deps = {}
-  Pathname.glob('**/*.o').sort.each {|fn_o|
-    fn_i = fn_o.sub_ext('.i')
-    if !fn_i.exist?
-      next if fn_o.sub_ext('.S').exist?
-      warn "warning: not found: #{fn_i}"
-      $i_not_found = true
-      next
+  if File.exist?("update-deps-file-list.txt")
+    File.readlines("update-deps-file-list.txt").each do |line|
+      line.chomp!
+      file_i = line
+      unless File.exist?(file_i)
+        abort "Expected '#{file_i}' to exist"
+      end
+      fn_o = file_i.sub(".i", ".o")
+      path_o = cwd + fn_o
+      path_i = cwd + file_i
+      deps[path_o] = read_single_cc_deps(path_i, cwd, fn_o)
     end
-    path_o = cwd + fn_o
-    path_i = cwd + fn_i
-    deps[path_o] = read_single_cc_deps(path_i, cwd, fn_o)
-  }
+  else
+    Pathname.glob('**/*.o').sort.each {|fn_o|
+      fn_i = fn_o.sub_ext('.i')
+      if !fn_i.exist?
+        next if fn_o.sub_ext('.S').exist?
+        warn "warning: not found: #{fn_i}"
+        $i_not_found = true
+        next
+      end
+      path_o = cwd + fn_o
+      path_i = cwd + fn_i
+      deps[path_o] = read_single_cc_deps(path_i, cwd, fn_o)
+    }
+  end
   deps
 end
 
@@ -460,12 +474,16 @@ end
 
 def detect_dependencies(out=$stdout)
   cwd = Pathname.pwd
+  $stderr.puts "reading make deps"
   make_deps = read_make_deps(cwd)
   #pp make_deps
+  $stderr.puts "concentrating make deps"
   make_deps = concentrate(make_deps, cwd)
   #pp make_deps
+  $stderr.puts "reading cc deps"
   cc_deps = read_cc_deps(cwd)
   #pp cc_deps
+  $stderr.puts "concentrating cc deps"
   cc_deps = concentrate(cc_deps, cwd)
   #pp cc_deps
   return make_deps, cc_deps
@@ -556,13 +574,15 @@ def prepare_build
     elsif !File.exist?("configure")
       system("autoreconf", "-i", "-s")
     end
-    system("./configure", "-q", "--enable-load-relative", "--prefix=/.",
-           "--disable-install-doc", "debugflags=-save-temps=obj -g")
+    cmd = ["./configure", "-C", "-q", "--enable-load-relative", "--prefix=/.",
+           "--disable-install-doc", "debugflags=-save-temps=obj -g"]
+    p cmd.join(" ")
+    system(*cmd)
   end
 end
 
 def main_show(out=$stdout)
-  prepare_build
+  prepare_build unless ENV["SKIP_PREPARE_BUILD"]
   make_deps, cc_deps = detect_dependencies(out)
   compare_deps(make_deps, cc_deps, out)
 end

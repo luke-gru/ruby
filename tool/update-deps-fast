@@ -1,0 +1,59 @@
+#!/usr/bin/env ruby
+
+# Skip compilation, use only preprocessor to figure out dependencies. Only works with clang right now.
+# Works even when building out-of-tree.
+
+SRCDIR = File.expand_path("../", __dir__)
+
+shim_dir = File.join(SRCDIR, "tool", "shims", "clang")
+
+orig_clang =  `which clang`.chomp # TODO: should use Makefile to figure out path of CC
+orig_path = ENV["PATH"]
+
+ENV["PATH"] = shim_dir + ":" + ENV["PATH"]
+ENV["UPDATE_DEPS_ORIG_CLANG"] = orig_clang
+
+file_list_path = File.join(Dir.pwd, "update-deps-file-list.txt")
+File.unlink(file_list_path) if File.exist?(file_list_path)
+File.open(file_list_path, "w") { }
+ENV["UPDATE_DEPS_FILE_LIST"] = file_list_path
+
+require "fileutils"
+# Trick make to rebuild everything
+# TODO: I could probably use `make -t ruby` instead. Don't use make -b because we don't want to reconfigure
+Dir.glob(File.join(SRCDIR, "**", "*")).each do |f|
+  if File.file?(f) && File.extname(f) == ".c"
+    FileUtils.touch(f)
+  end
+end
+
+# generate .i files using our shimmed compiler, skipping compilation
+system("make -j8 ruby")
+
+def in_srcdir
+  if Dir.pwd != SRCDIR
+    Dir.chdir(SRCDIR) do
+      yield
+    end
+  else
+    yield
+  end
+end
+
+# if build dir not srcdir, copy i files to srcdir so tool/update-deps works
+if Dir.pwd != SRCDIR
+  File.readlines(file_list_path).each do |i_file|
+    i_file.chomp!
+    if !File.exist?(i_file)
+      abort "Error: Expected file '#{i_file}' to exist"
+    end
+    FileUtils.cp(i_file, File.join(SRCDIR, i_file))
+  end
+  # copy the list of .i files
+  FileUtils.cp(file_list_path, File.join(SRCDIR, File.basename(file_list_path)))
+end
+
+in_srcdir do
+  ENV["SKIP_PREPARE_BUILD"]="1"
+  system("./tool/update-deps", "--fix")
+end

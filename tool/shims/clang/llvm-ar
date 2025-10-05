@@ -1,0 +1,3 @@
+#!/usr/bin/env ruby
+p "llvm-ar:"
+p ARGV

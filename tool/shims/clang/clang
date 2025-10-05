@@ -1,0 +1,42 @@
+#!/usr/bin/env ruby
+
+if ARGV.size == 1 && ARGV[0] == "--version"
+  exit
+end
+
+out = ARGV.rindex("-o")
+if out.nil?
+  abort "no -o option given"
+end
+
+output_file = ARGV[out+1]
+if File.extname(output_file) != ".o"
+  exit
+end
+
+output_file = output_file.sub(".o", ".i")
+File.unlink(output_file) if File.exist?(output_file)
+ARGV[out+1] = output_file
+
+# tool/update-deps configures without RUBY_DEBUG set
+ruby_debug_i = ARGV.index { |el| el =~ /-DRUBY_DEBUG/ }
+if ruby_debug_i
+  ARGV.slice!(ruby_debug_i)
+end
+
+p "clang:"
+p ARGV
+
+orig_clang = ENV["UPDATE_DEPS_ORIG_CLANG"]
+abort "no orig clang" if orig_clang.nil? || orig_clang.strip.empty?
+file_list =  ENV["UPDATE_DEPS_FILE_LIST"]
+
+system(orig_clang, "-E", *ARGV)
+
+if $?.exitstatus == 0
+  File.open(file_list, "a+") do |f|
+    f.flock(File::LOCK_EX)
+    f.seek(0, IO::SEEK_END)
+    f.puts output_file
+  end
+end

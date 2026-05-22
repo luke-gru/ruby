@@ -5282,6 +5282,17 @@ gc_sweep_step_worker(rb_objspace_t *objspace, rb_heap_t *heap, int *swept_pages_
     // sweep_lock is acquired
 }
 
+static const char*
+worker_mode(rb_objspace_t *objspace)
+{
+    if (objspace->background_sweep_mode) {
+        return "bg";
+    }
+    else {
+        return "fg";
+    }
+}
+
 static void *
 gc_sweep_thread_func(void *ptr)
 {
@@ -5318,7 +5329,6 @@ gc_sweep_thread_func(void *ptr)
     bool restart;
     bool abort;
     restart_heaps:
-        heaps_skipped = 0;
         done_all = false;
         restart = false;
         abort = false;
@@ -5336,13 +5346,19 @@ gc_sweep_thread_func(void *ptr)
             /*fprintf(stderr, "gc_sweep_worker heap %lu swept %d pages, returned:%s (%s)\n", heap - heaps, swept_pages_num, sweep_step_worker_state_str(state), objspace->background_sweep_mode ? "bg" : "fg");*/
             switch (state) {
                 case WORKER_SKIP_HEAP:
-                    heaps_skipped++;
+                    /*fprintf(stderr, "worker:%s skip heap (skip_continue in fg) heap:%lu\n", worker_mode(objspace), heap - heaps);*/
                     break;
                 case WORKER_NEXT_HEAP_FG:
+                    /*fprintf(stderr, "worker:fg goto next heap (budget done) heap:%lu\n", heap - heaps);*/
+                    break;
                 case WORKER_NEXT_HEAP_BG:
+                    /*fprintf(stderr, "worker:bg goto next heap (budget done) heap:%lu\n", heap - heaps);*/
+                    break;
                 case WORKER_DONE_HEAP:
+                    /*fprintf(stderr, "worker:%s done heap:%lu\n", worker_mode(objspace), heap - heaps);*/
                     break;
                 case WORKER_DONE_ALL_HEAPS:
+                    /*fprintf(stderr, "worker:%s done all heaps\n", worker_mode(objspace));*/
                     done_all = true;
                     break;
                 case WORKER_RESTART_SWEEP_HEAPS:
@@ -5355,12 +5371,8 @@ gc_sweep_thread_func(void *ptr)
             if (abort || done_all) {
                 break;
             } else if (restart) {
+                /*fprintf(stderr, "restart heaps\n");*/
                 objspace->background_sweep_restart_heaps = false;
-                goto restart_heaps;
-            } else if (heaps_skipped == HEAP_COUNT) {
-                break;
-            } else if (i == HEAP_COUNT-1 && objspace->background_sweep_mode) {
-                /*fprintf(stderr, "restarting in bg mode!\n");*/
                 goto restart_heaps;
             }
         }

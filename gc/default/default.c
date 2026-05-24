@@ -3207,12 +3207,20 @@ rb_gc_impl_pointer_to_heap_p(void *objspace_ptr, const void *ptr)
 }
 
 static size_t made_zombies;
+/* Per-type counter of how many objects of each ruby_value_type were turned
+ * into zombies (i.e. had a finalizer attached and entered the deferred-
+ * finalization queue). Indexed by BUILTIN_TYPE(obj) at make-zombie time,
+ * before zombie->flags overwrites it with T_ZOMBIE. Surfaced via GC.stat
+ * key :made_zombies_by_type. */
+static size_t made_zombies_by_type[T_MASK + 1];
 
 void
 rb_gc_impl_make_zombie(void *objspace_ptr, VALUE obj, void (*dfree)(void *), void *data)
 {
     rb_objspace_t *objspace = objspace_ptr;
 
+    GC_ASSERT(BUILTIN_TYPE(obj) != T_ZOMBIE);
+    made_zombies_by_type[BUILTIN_TYPE(obj)]++;
     struct heap_page *page = GET_HEAP_PAGE(obj);
     struct RZombie *zombie = RZOMBIE(obj);
     zombie->flags = T_ZOMBIE | (zombie->flags & ZOMBIE_OBJ_KEPT_FLAGS);
@@ -4213,10 +4221,10 @@ gc_sweep_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t bit
         }
         p += slot_size;
         bitset >>= 1;
-        if (bitset) {
+        /*if (bitset) {*/
             /* Write-prefetch next set slot: obj_free / heap_page_add_freeobj writes it. */
-            __builtin_prefetch((void *)(p + __builtin_ctzll(bitset) * slot_size), 1, 3);
-        }
+            /*__builtin_prefetch((void *)(p + __builtin_ctzll(bitset) * slot_size), 1, 3);*/
+        /*}*/
     } while (bitset);
 }
 
@@ -9433,6 +9441,7 @@ enum gc_stat_sym {
     gc_stat_sym_pages_swept_by_ruby_thread,
 #endif
     gc_stat_sym_made_zombies,
+    gc_stat_sym_made_zombies_by_type,
 #if RGENGC_ESTIMATE_OLDMALLOC
     gc_stat_sym_oldmalloc_increase_bytes,
     gc_stat_sym_oldmalloc_increase_bytes_limit,
@@ -9497,6 +9506,7 @@ setup_gc_stat_symbols(void)
         S(pages_swept_by_ruby_thread);
 #endif
         S(made_zombies);
+        S(made_zombies_by_type);
 #if RGENGC_ESTIMATE_OLDMALLOC
         S(oldmalloc_increase_bytes);
         S(oldmalloc_increase_bytes_limit);
@@ -9593,6 +9603,17 @@ rb_gc_impl_stat(void *objspace_ptr, VALUE hash_or_sym)
     SET(pages_swept_by_ruby_thread, objspace->sweep_stats.pages_swept_by_ruby_thread);
 #endif
     SET(made_zombies, made_zombies);
+    if (key == gc_stat_symbols[gc_stat_sym_made_zombies_by_type] || hash != Qnil) {
+        VALUE by_type = rb_hash_new();
+        for (int i = 0; i <= T_MASK; i++) {
+            if (made_zombies_by_type[i] == 0) continue;
+            rb_hash_aset(by_type,
+                         rb_str_new_cstr(type_name(i, 0)),
+                         SIZET2NUM(made_zombies_by_type[i]));
+        }
+        if (key == gc_stat_symbols[gc_stat_sym_made_zombies_by_type]) return by_type;
+        rb_hash_aset(hash, gc_stat_symbols[gc_stat_sym_made_zombies_by_type], by_type);
+    }
 #if RGENGC_ESTIMATE_OLDMALLOC
     SET(oldmalloc_increase_bytes, gc_malloc_counters_increase_unsigned(objspace, &objspace->malloc_counters.oldcounters));
     SET(oldmalloc_increase_bytes_limit, objspace->rgengc.oldmalloc_increase_limit);

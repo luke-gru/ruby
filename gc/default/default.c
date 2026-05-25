@@ -3206,7 +3206,7 @@ rb_gc_impl_pointer_to_heap_p(void *objspace_ptr, const void *ptr)
     return is_pointer_to_heap(objspace_ptr, ptr);
 }
 
-static size_t made_zombies;
+static rb_atomic_t made_zombies;
 /* Per-type counter of how many objects of each ruby_value_type were turned
  * into zombies (i.e. had a finalizer attached and entered the deferred-
  * finalization queue). Indexed by BUILTIN_TYPE(obj) at make-zombie time,
@@ -3237,7 +3237,7 @@ rb_gc_impl_make_zombie(void *objspace_ptr, VALUE obj, void (*dfree)(void *), voi
     RUBY_ATOMIC_INC(page->heap->made_zombies);
 #endif
     RUBY_ATOMIC_SIZE_INC(page->heap->final_slots_count);
-    made_zombies++;
+    RUBY_ATOMIC_INC(made_zombies);
 }
 
 typedef int each_obj_callback(void *, void *, size_t, void *);
@@ -9600,7 +9600,7 @@ rb_gc_impl_stat(void *objspace_ptr, VALUE hash_or_sym)
     SET(pages_swept_by_sweep_thread_had_deferred_free_objects, objspace->sweep_stats.pages_swept_by_sweep_thread_had_deferred_free_objects);
     SET(pages_swept_by_ruby_thread, objspace->sweep_stats.pages_swept_by_ruby_thread);
 #endif
-    SET(made_zombies, made_zombies);
+    SET(made_zombies, (size_t)made_zombies);
     if (key == gc_stat_symbols[gc_stat_sym_made_zombies_by_type] || hash != Qnil) {
         VALUE by_type = rb_hash_new();
         for (int i = 0; i <= T_MASK; i++) {

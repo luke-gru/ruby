@@ -4931,39 +4931,23 @@ gc_sweep_step_worker(rb_objspace_t *objspace, rb_heap_t *heap, int *swept_pages_
 
         if (!objspace->background_sweep_mode) {
             sweep_thread_signal_enqueued_pages(objspace, heap);
+            return WORKER_STOP;
         }
 
-        if (heap->sweeping_page) {
-            if (page_bg_slots > 0 && objspace->background_sweep_mode && !objspace->background_sweep_abort && !objspace->background_sweep_restart_heaps) {
-                if (bg_slots_total >= sweep_budget + pool_budget) {
-                    return WORKER_NEXT_HEAP_BG;
-                }
-            }
-            if (!objspace->background_sweep_mode) {
-                return WORKER_STOP;
-            }
-            else {
-                if (RB_UNLIKELY(objspace->background_sweep_abort)) {
-                    return WORKER_ABORT_SWEEP_HEAPS;
-                }
-                else if (objspace->background_sweep_restart_heaps) {
-                    return WORKER_RESTART_SWEEP_HEAPS;
-                }
+        if (RB_UNLIKELY(objspace->background_sweep_abort)) {
+            return WORKER_ABORT_SWEEP_HEAPS;
+        }
+        else if (objspace->background_sweep_restart_heaps) {
+            return WORKER_RESTART_SWEEP_HEAPS;
+        }
+
+        if (heap->sweeping_page && page_bg_slots > 0) {
+            if (bg_slots_total >= sweep_budget + pool_budget) {
+                return WORKER_NEXT_HEAP_BG;
             }
         }
     }
     // sweep_lock is acquired
-}
-
-static const char*
-worker_mode(rb_objspace_t *objspace)
-{
-    if (objspace->background_sweep_mode) {
-        return "bg";
-    }
-    else {
-        return "fg";
-    }
 }
 
 static void *
@@ -4997,7 +4981,6 @@ gc_sweep_thread_func(void *ptr)
         objspace->background_sweep_restart_heaps = false;
         objspace->sweep_thread_sweeping = true;
 
-    int heaps_skipped;
     bool done_all;
     bool restart;
     bool abort;
@@ -5524,7 +5507,6 @@ gc_sweep_step(rb_objspace_t *objspace, rb_heap_t *heap)
 
 #if USE_PARALLEL_SWEEP
     psweep_debug(-2, "[gc] gc_sweep_step heap:%p (%ld) use_sweep_thread:%d\n", heap, heap - heaps, objspace->use_background_sweep_thread);
-    bool sweep_rest = objspace->sweep_rest;
     bool use_sweep_thread = objspace->use_background_sweep_thread;
 #endif
     bool is_last_page = false;

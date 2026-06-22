@@ -594,6 +594,16 @@ register_fstring(VALUE str, bool copy, bool force_precompute_hash)
     return result;
 }
 
+VALUE
+rb_fstring_existing(VALUE str)
+{
+    RUBY_ASSERT(RB_TYPE_P(str, T_STRING));
+
+    if (!fstring_table_obj) return 0;
+
+    return rb_concurrent_set_find(&fstring_table_obj, str);
+}
+
 bool
 rb_obj_is_fstring_table(VALUE obj)
 {

@@ -36,6 +36,7 @@
 #include "internal/object.h"
 #include "internal/proc.h"
 #include "internal/st.h"
+#include "internal/string.h"
 #include "internal/symbol.h"
 #include "internal/thread.h"
 #include "internal/time.h"
@@ -2901,7 +2902,12 @@ VALUE
 rb_hash_key_str(VALUE key)
 {
     if (!rb_obj_gen_fields_p(key) && RBASIC_CLASS(key) == rb_cString) {
-        return rb_fstring(key);
+        if (CHILLED_STRING_P(key)) {
+            return rb_fstring(key);
+        }
+        VALUE fstr = rb_fstring_existing(key);
+        if (fstr) return fstr;
+        return rb_str_new_frozen(key);
     }
     else {
         return rb_str_new_frozen(key);

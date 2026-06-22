@@ -2027,10 +2027,36 @@ class TestHashOnly < Test::Unit::TestCase
   end
 
   def test_ASET_fstring_key
-    a, b = {}, {}
-    assert_equal 1, a["abc"] = 1
-    assert_equal 1, b["abc"] = 1
-    assert_same a.keys[0], b.keys[0]
+    # Note: this file is frozen_string_literal: false, so a bare "abc" literal
+    # is a plain mutable string. A mutable string key is stored as a frozen,
+    # mutation-safe snapshot (it is not interned through the fstring table the
+    # way a chilled key is).
+    s = "abc".dup
+    h = {}
+    assert_equal 1, h[s] = 1
+    key = h.keys[0]
+    assert_predicate key, :frozen?
+    assert_equal "abc", key
+    refute_same s, key
+    # Mutating the original source must not corrupt the stored key.
+    s << "X"
+    assert_equal 1, h["abc"]
+    assert_nil h["abcX"]
+  end
+
+  def test_ASET_frozen_string_key_stored_as_is
+    # A frozen string key is stored as-is: not duplicated and not re-interned,
+    # so its identity is preserved.
+    fk = "abc".dup.freeze
+    h = {}
+    h[fk] = 1
+    assert_same fk, h.keys[0]
+
+    # An existing fstring key is likewise stored by identity (no copy).
+    fstr = -"xyz"
+    h2 = {}
+    h2[fstr] = 1
+    assert_same fstr, h2.keys[0]
   end
 
   def test_ASET_fstring_non_literal_key
@@ -2046,8 +2072,12 @@ class TestHashOnly < Test::Unit::TestCase
       assert_equal 1, b[string] = 1
     end
 
+    # Plain mutable (non-literal) string keys are stored as frozen snapshots and
+    # are not deduplicated across hashes.
     [a.keys, b.keys].transpose.each do |key_a, key_b|
-      assert_same key_a, key_b
+      assert_equal key_a, key_b
+      assert_not_same key_a, key_b
+      assert_predicate key_a, :frozen?
     end
   end
 
@@ -2065,13 +2095,22 @@ class TestHashOnly < Test::Unit::TestCase
   end
 
   def test_NEWHASH_fstring_key
+    # frozen_string_literal: false, so a "ABC" literal is mutable: a mutable
+    # key is stored as a frozen, mutation-safe snapshot.
     a = {"ABC" => :t}
-    b = {"ABC" => :t}
-    assert_same a.keys[0], b.keys[0]
-    assert_same "ABC".freeze, a.keys[0]
-    var = +'ABC'
+    assert_predicate a.keys[0], :frozen?
+    assert_equal "ABC", a.keys[0]
+
+    var = "ABC".dup
     c = { var => :t }
-    assert_same "ABC".freeze, c.keys[0]
+    key = c.keys[0]
+    assert_predicate key, :frozen?
+    assert_equal "ABC", key
+    refute_same var, key
+    # Mutating the source must not corrupt the stored key.
+    var << "Z"
+    assert_equal :t, c["ABC"]
+    assert_nil c["ABCZ"]
   end
 
   def test_rehash_memory_leak

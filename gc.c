@@ -2344,6 +2344,18 @@ obj_free_object_id(VALUE obj)
     }
 }
 
+/* Total number of fstrings removed from the fstring table during sweeping,
+ * since process start. Exposed via GC.stat[:fstrings_swept]. Only mutated
+ * while sweeping under the VM barrier (see rb_gc_free_fstring), so it does
+ * not need atomic access. */
+static size_t fstrings_swept_count = 0;
+
+size_t
+rb_gc_fstrings_swept_count(void)
+{
+    return fstrings_swept_count;
+}
+
 void
 rb_gc_obj_free_vm_weak_references(VALUE obj)
 {
@@ -2357,6 +2369,7 @@ rb_gc_obj_free_vm_weak_references(VALUE obj)
     switch (BUILTIN_TYPE(obj)) {
       case T_STRING:
         if (FL_TEST_RAW(obj, RSTRING_FSTR)) {
+            fstrings_swept_count++;
             rb_gc_free_fstring(obj);
         }
         break;

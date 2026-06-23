@@ -9,6 +9,9 @@ struct rb_concurrent_set_funcs {
     bool (*cmp)(VALUE a, VALUE b);
     VALUE (*create)(VALUE key, void *data);
     void (*free)(VALUE key);
+    // Optional: called once each time the set is rebuilt into a larger (or
+    // smaller) table. May be NULL. Runs while the resize holds the VM lock.
+    void (*on_rebuild)(void);
 };
 
 VALUE rb_concurrent_set_new(const struct rb_concurrent_set_funcs *funcs, int capacity);

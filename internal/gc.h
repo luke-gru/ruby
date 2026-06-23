@@ -214,6 +214,11 @@ void rb_gc_ref_update_table_values_only(st_table *tbl);
 
 void rb_gc_initial_stress_set(VALUE flag);
 
+/* fstring table bookkeeping, surfaced through GC.stat. Defined in gc.c and
+ * called from the fstring table machinery (string.c / concurrent_set.c). */
+void rb_gc_fstring_created_inc(void);
+void rb_gc_fstring_table_rebuilt_inc(void);
+
 void rb_gc_before_fork(void);
 void rb_gc_after_fork(rb_pid_t pid);
 

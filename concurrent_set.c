@@ -204,6 +204,10 @@ concurrent_set_try_resize_without_locking(VALUE old_set_obj, VALUE *set_obj_ptr)
 
     rbimpl_atomic_value_store(set_obj_ptr, new_set_obj, RBIMPL_ATOMIC_RELEASE);
 
+    if (old_set->funcs->on_rebuild) {
+        old_set->funcs->on_rebuild();
+    }
+
     RB_GC_GUARD(old_set_obj);
 }
 

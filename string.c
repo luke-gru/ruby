@@ -485,6 +485,9 @@ fstring_concurrent_set_create(VALUE str, void *data)
 {
     struct fstr_create_arg *arg = data;
 
+    // A new fstring is being interned (the lookup missed the table).
+    rb_gc_fstring_created_inc();
+
     // Unless the string is empty or binary, its coderange has been precomputed.
     int coderange = ENC_CODERANGE(str);
 
@@ -551,11 +554,18 @@ fstring_concurrent_set_create(VALUE str, void *data)
     return str;
 }
 
+static void
+fstring_concurrent_set_on_rebuild(void)
+{
+    rb_gc_fstring_table_rebuilt_inc();
+}
+
 static const struct rb_concurrent_set_funcs fstring_concurrent_set_funcs = {
     .hash = fstring_concurrent_set_hash,
     .cmp = fstring_concurrent_set_cmp,
     .create = fstring_concurrent_set_create,
     .free = NULL,
+    .on_rebuild = fstring_concurrent_set_on_rebuild,
 };
 
 void

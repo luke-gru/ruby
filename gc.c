@@ -2356,6 +2356,41 @@ rb_gc_fstrings_swept_count(void)
     return fstrings_swept_count;
 }
 
+/* Total number of fstrings created (newly interned into the fstring table),
+ * since process start. Exposed via GC.stat[:fstrings_created]. Incremented from
+ * the fstring table's lock-free insert path (string.c), so it must be atomic. */
+static size_t fstrings_created_count = 0;
+
+void
+rb_gc_fstring_created_inc(void)
+{
+    RUBY_ATOMIC_SIZE_INC(fstrings_created_count);
+}
+
+size_t
+rb_gc_fstrings_created_count(void)
+{
+    return fstrings_created_count;
+}
+
+/* Total number of times the fstring table has been rebuilt (resized), since
+ * process start. Exposed via GC.stat[:fstring_table_rebuilds]. Incremented from
+ * the fstring table's on_rebuild callback (string.c); kept atomic for uniformity
+ * with the lock-free counters above. */
+static size_t fstring_table_rebuild_count = 0;
+
+void
+rb_gc_fstring_table_rebuilt_inc(void)
+{
+    RUBY_ATOMIC_SIZE_INC(fstring_table_rebuild_count);
+}
+
+size_t
+rb_gc_fstring_table_rebuild_count(void)
+{
+    return fstring_table_rebuild_count;
+}
+
 void
 rb_gc_obj_free_vm_weak_references(VALUE obj)
 {

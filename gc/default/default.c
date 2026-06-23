@@ -7843,6 +7843,8 @@ enum gc_stat_sym {
     gc_stat_sym_total_allocated_objects,
     gc_stat_sym_total_freed_objects,
     gc_stat_sym_fstrings_swept,
+    gc_stat_sym_fstrings_created,
+    gc_stat_sym_fstring_table_rebuilds,
     gc_stat_sym_total_malloc_bytes,
     gc_stat_sym_total_free_bytes,
     gc_stat_sym_malloc_increase_bytes,
@@ -7896,6 +7898,8 @@ setup_gc_stat_symbols(void)
         S(total_allocated_objects);
         S(total_freed_objects);
         S(fstrings_swept);
+        S(fstrings_created);
+        S(fstring_table_rebuilds);
         S(total_malloc_bytes);
         S(total_free_bytes);
         S(malloc_increase_bytes);
@@ -8004,6 +8008,8 @@ rb_gc_impl_stat(void *objspace_ptr, VALUE hash_or_sym)
     SET(total_allocated_objects, total_allocated_objects(objspace));
     SET(total_freed_objects, total_freed_objects(objspace));
     SET(fstrings_swept, rb_gc_fstrings_swept_count());
+    SET(fstrings_created, rb_gc_fstrings_created_count());
+    SET(fstring_table_rebuilds, rb_gc_fstring_table_rebuild_count());
     SET(heap_available_slots, objspace_available_slots(objspace));
     SET(heap_live_slots, objspace_live_slots(objspace));
     SET(heap_free_slots, objspace_free_slots(objspace));

@@ -1268,6 +1268,38 @@ module Test
       end
     end
 
+    # Reports the GC's process-wide page pool after a run.  Only meaningful serially:
+    # under --jobs the workers do the allocating, so the manager's pool is not the one
+    # the tests exercised.  Prints nothing on a GC with no page pool.
+    module GCStatistics # :nodoc: all
+      PAGE_POOL_KEYS = [
+        :page_pool_arenas,
+        :page_pool_arenas_freed,
+        :page_pool_total_pages,
+        :page_pool_free_pages,
+        :page_pool_discarded_pages,
+        :page_pool_advises,
+        :page_pool_reuses,
+        :page_pool_warm_floor,
+      ]
+
+      def run(*args)
+        result = super
+        unless options[:parallel]   # lazy reader: @options is nil for a bare Runner
+          stat = GC.stat
+          if (PAGE_POOL_KEYS & stat.keys).size != PAGE_POOL_KEYS.size
+            return result
+          end
+          keys = PAGE_POOL_KEYS.select {|k| stat.key?(k)}
+          unless keys.empty?
+            puts "\npage pool: " +
+                 keys.map {|k| "#{k.to_s.delete_prefix("page_pool_")}=#{stat[k]}"}.join(" ")
+          end
+        end
+        result
+      end
+    end
+
     module RequireFiles # :nodoc: all
       def non_options(files, options)
         return false if !super
@@ -1823,6 +1855,7 @@ module Test
       prepend Test::Unit::TimeoutOption
       prepend Test::Unit::RunCount
       prepend Test::Unit::LaunchableOption::Nothing
+      prepend Test::Unit::GCStatistics
 
       ##
       # Begins the full test run. Delegates to +runner+'s #_run method.

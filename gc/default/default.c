@@ -877,6 +877,9 @@ typedef struct rb_global_objspace {
         int arena_count;                  /* current mapped arenas (for GC.stat total_pages) */
         int advised_count;                /* bodies with MADV_* applied (GC.stat discarded pages) */
         size_t arenas_unmapped;           /* cumulative arenas munmapped (for GC.stat) */
+        size_t advise_calls;              /* cumulative Step A madvise calls (for GC.stat) */
+        size_t reuse_calls;               /* cumulative advised bodies re-acquired; one
+                                           * MADV_FREE_REUSE each on Darwin (for GC.stat) */
         size_t acquired_in_window;        /* bodies handed out since rate_window_start */
         rb_hrtime_t rate_window_start;    /* start of the current acquire-rate window */
         size_t warm_floor;                /* free bodies page_pool_reclaim keeps warm */
@@ -1019,6 +1022,8 @@ global_objspace_init(void)
         g->tdata_unsafe_free_cache = NULL;
         g->tdata_unsafe_free_cache_len = 0;
         g->page_pool.arenas_unmapped = 0;
+        g->page_pool.advise_calls = 0;
+        g->page_pool.reuse_calls = 0;
         g->page_pool.acquired_in_window = 0;
         g->page_pool.rate_window_start = rb_hrtime_now();
         g->page_pool.clock_last = g->page_pool.rate_window_start;
@@ -2818,6 +2823,7 @@ page_pool_acquire(struct page_arena **arena_out)
                 if (need_reuse) {
                     a->advised_count--;
                     g->page_pool.advised_count--;
+                    g->page_pool.reuse_calls++;
                 }
                 break;
             }
@@ -3072,6 +3078,7 @@ page_pool_reclaim(rb_global_objspace_t *g, size_t budget)
                     fb->link = link | PAGE_POOL_ADVISED_BIT;
                     a->advised_count++;
                     g->page_pool.advised_count++;
+                    g->page_pool.advise_calls++;
                 }
             }
             asan_poison_memory_region(body, PAGE_POOL_SCRATCH_SIZE);
@@ -11287,6 +11294,8 @@ enum gc_stat_sym {
     gc_stat_sym_page_pool_arenas_freed,
     gc_stat_sym_page_pool_total_pages,
     gc_stat_sym_page_pool_discarded_pages,
+    gc_stat_sym_page_pool_advises,
+    gc_stat_sym_page_pool_reuses,
     gc_stat_sym_page_pool_free_pages,
     gc_stat_sym_page_pool_warm_floor,
     gc_stat_sym_last
@@ -11345,6 +11354,8 @@ setup_gc_stat_symbols(void)
     S(page_pool_arenas_freed);
     S(page_pool_total_pages);
     S(page_pool_discarded_pages);
+    S(page_pool_advises);
+    S(page_pool_reuses);
     S(page_pool_free_pages);
     S(page_pool_warm_floor);
 #undef S
@@ -11506,6 +11517,8 @@ rb_gc_impl_stat(void *objspace_ptr, VALUE hash_or_sym)
     SET(page_pool_arenas_freed, global_objspace->page_pool.arenas_unmapped);
     SET(page_pool_total_pages, (size_t)global_objspace->page_pool.arena_count * PAGE_POOL_ARENA_BODIES);
     SET(page_pool_discarded_pages, global_objspace->page_pool.advised_count);
+    SET(page_pool_advises, global_objspace->page_pool.advise_calls);
+    SET(page_pool_reuses, global_objspace->page_pool.reuse_calls);
     SET(page_pool_free_pages, global_objspace->page_pool.free_count_total);
     SET(page_pool_warm_floor, global_objspace->page_pool.warm_floor);
 

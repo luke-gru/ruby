@@ -848,9 +848,11 @@ typedef struct rb_global_objspace {
             char *start;                  /* usable area, HEAP_PAGE_ALIGN aligned */
             size_t size;                  /* usable bytes (a multiple of HEAP_PAGE_SIZE) */
             struct heap_page_body *cold_freelist; /* free bodies of this arena; link at body offset 0 */
-            int free_count;               /* bodies of this arena currently free (hot list + cold_freelist) */
+            int free_count;               /* bodies of this arena currently free (on cold_freelist) */
             int cold_count;               /* bodies on cold_freelist (subset of free_count) */
-            int aged_count;               /* cold bodies that have reached PAGE_POOL_RECLAIM_AGE */
+            int advised_count;            /* free bodies of this arena with PAGE_POOL_ADVISED_BIT set */
+            bool has_warm;                /* a body of this arena fell inside the warm floor this reclaim */
+            rb_hrtime_t newest_free_since; /* free_since of the latest release into this arena */
         } *arenas;                        /* every arena, newest first */
         char *arena_cursor;               /* first body not yet carved out of the newest arena */
         char *arena_end;                  /* end of current arena */
@@ -858,8 +860,14 @@ typedef struct rb_global_objspace {
         int arena_count;                  /* current mapped arenas (for GC.stat total_pages) */
         int advised_count;                /* page bodies with MADV_* applied (for GC.stat discarded pages) */
         size_t arenas_unmapped;           /* cumulative arenas munmapped (for GC.stat) */
-        size_t acquired_since_reclaim;    /* bodies handed out since the last page_pool_reclaim */
-        size_t warm_floor;                /* free bodies page_pool_reclaim keeps warm (decaying peak of the above) */
+        size_t acquired_in_window;        /* bodies handed out since rate_window_start */
+        rb_hrtime_t rate_window_start;    /* start of the current acquire-rate window */
+        size_t warm_floor;                /* free bodies page_pool_reclaim keeps warm (acquire rate x PAGE_POOL_ADVISE_IDLE_NS, decayed) */
+        size_t warm_peak;                 /* warm_floor decays from this value ... */
+        rb_hrtime_t warm_peak_time;       /* ... set at this time */
+        /* Read without the lock by page_pool_reclaim_due (minor GCs), so accessed atomically. */
+        rbimpl_atomic_uint64_t last_reclaim; /* when page_pool_reclaim last ran */
+        rbimpl_atomic_uint64_t next_due;     /* earliest time a free body or arena may become reclaimable */
     } page_pool;
 
     /* Zombie pages left after the last global cycle (roughly the live data).  Updated
@@ -948,7 +956,7 @@ static void objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src);
 static struct heap_page_body *page_pool_acquire(struct page_arena **arena_out);
 static void page_pool_release(struct heap_page_body *body, struct page_arena *arena);
 #ifdef HAVE_MMAP
-static void page_pool_release_locked(struct heap_page_body *body, struct page_arena *arena);
+static void page_pool_release_locked(struct heap_page_body *body, struct page_arena *arena, rb_hrtime_t now);
 #endif
 static void page_pool_reclaim(rb_global_objspace_t *g);
 
@@ -988,8 +996,13 @@ global_objspace_init(void)
         g->tdata_unsafe_free_cache = NULL;
         g->tdata_unsafe_free_cache_len = 0;
         g->page_pool.arenas_unmapped = 0;
-        g->page_pool.acquired_since_reclaim = 0;
+        g->page_pool.acquired_in_window = 0;
+        g->page_pool.rate_window_start = rb_hrtime_now();
         g->page_pool.warm_floor = 0;
+        g->page_pool.warm_peak = 0;
+        g->page_pool.warm_peak_time = g->page_pool.rate_window_start;
+        ATOMIC_U64_SET_RELAXED(g->page_pool.last_reclaim, g->page_pool.rate_window_start);
+        ATOMIC_U64_SET_RELAXED(g->page_pool.next_due, UINT64_MAX);
 #ifdef HAVE_MMAP
         g->page_pool.os_page_size = sysconf(_SC_PAGE_SIZE);
 #else
@@ -2482,11 +2495,14 @@ heap_pages_free_batch(rb_objspace_t *objspace, struct heap_page *pages)
     rb_global_objspace_t *g = global_objspace;
 
     rb_native_mutex_lock(&g->page_pool.lock);
+#ifdef HAVE_MMAP
+    rb_hrtime_t now = rb_hrtime_now();
+#endif
     for (struct heap_page *page = pages; page != NULL; page = page->free_next) {
         global_page_index_remove_locked(page);
         if (HEAP_PAGE_ALLOC_USE_MMAP) {
 #ifdef HAVE_MMAP
-            page_pool_release_locked(page->body, page->arena);
+            page_pool_release_locked(page->body, page->arena, now);
 #endif
         }
     }
@@ -2606,27 +2622,47 @@ gc_aligned_malloc(size_t alignment, size_t size)
 #define PAGE_POOL_ARENA_BODIES (PAGE_POOL_ARENA_SIZE / HEAP_PAGE_SIZE) /* 32 */
 #define PAGE_POOL_ARENA_KEEP_HALF (PAGE_POOL_ARENA_BODIES / 2) /* 16 */
 
-/* Tag bits stolen from the in-body link word (bodies are HEAP_PAGE_ALIGN aligned, so its
- * low bits are always zero).  Bit 0 is set iff the body has been madvise'd (cold).
- * Bits 1-3 count the page_pool_reclaim passes the body has sat free through, saturating
- * at PAGE_POOL_RECLAIM_AGE; only a body that old is advised, and only an arena whose
- * bodies all are is unmapped.  That hysteresis keeps a body the allocator is about to
- * re-request mapped and resident across a few GCs. */
+/* Tag bit stolen from the in-body link word (bodies are HEAP_PAGE_ALIGN aligned, so its
+ * low bits are always zero): set iff the body has been madvise'd (cold). */
 #define PAGE_POOL_ADVISED_BIT ((uintptr_t)1)
-#define PAGE_POOL_AGE_SHIFT 1
-#define PAGE_POOL_AGE_MASK ((uintptr_t)0x7 << PAGE_POOL_AGE_SHIFT)
-#define PAGE_POOL_LINK_TAG_MASK (PAGE_POOL_ADVISED_BIT | PAGE_POOL_AGE_MASK)
+#define PAGE_POOL_LINK_TAG_MASK PAGE_POOL_ADVISED_BIT
 #define PAGE_POOL_LINK_NEXT(link) ((struct heap_page_body *)((link) & ~PAGE_POOL_LINK_TAG_MASK))
-#define PAGE_POOL_LINK_AGE(link) (((link) & PAGE_POOL_AGE_MASK) >> PAGE_POOL_AGE_SHIFT)
-#define PAGE_POOL_RECLAIM_AGE 3
 STATIC_ASSERT(page_pool_link_tags_fit, PAGE_POOL_LINK_TAG_MASK < HEAP_PAGE_ALIGN);
-STATIC_ASSERT(page_pool_reclaim_age_fits,
-              PAGE_POOL_RECLAIM_AGE <= (PAGE_POOL_AGE_MASK >> PAGE_POOL_AGE_SHIFT));
 
-/* While a body is free, only the in-body link word at offset 0 is used as scratch
- * (the rest stays poisoned).  PAGE_POOL_SCRATCH_SIZE covers that one word for ASAN
- * unpoison; heap_add_page's memset re-initializes the slot area on acquire. */
-#define PAGE_POOL_SCRATCH_SIZE (sizeof(struct heap_page_header))
+/* While a body is free, its first two words hold pool bookkeeping (the rest stays
+ * poisoned, and from os_page_size on may be advised).  PAGE_POOL_SCRATCH_SIZE covers
+ * them for ASAN unpoison; heap_add_page's memset re-initializes the slot area on
+ * acquire. */
+struct page_pool_free_body {
+    uintptr_t link;          /* next free body in this arena | PAGE_POOL_ADVISED_BIT */
+    rb_hrtime_t free_since;  /* monotonic time of the release, read under page_pool.lock */
+};
+#define PAGE_POOL_SCRATCH_SIZE (sizeof(struct page_pool_free_body))
+STATIC_ASSERT(page_pool_free_body_link_first, offsetof(struct page_pool_free_body, link) == 0);
+STATIC_ASSERT(page_pool_free_body_fits, sizeof(struct page_pool_free_body) <= 4096);
+
+/* page_pool_reclaim advises a free body once it has been idle this long, and munmaps an
+ * arena once all its bodies have been free this long.  The warm floor halves every
+ * PAGE_POOL_FLOOR_HALF_LIFE_NS without demand; an acquire-rate sample needs a window of
+ * at least PAGE_POOL_RATE_MIN_WINDOW_NS. */
+#ifndef PAGE_POOL_ADVISE_IDLE_NS
+# define PAGE_POOL_ADVISE_IDLE_NS (1 * RB_HRTIME_PER_SEC)
+#endif
+#ifndef PAGE_POOL_UNMAP_IDLE_NS
+# define PAGE_POOL_UNMAP_IDLE_NS (5 * RB_HRTIME_PER_SEC)
+#endif
+#ifndef PAGE_POOL_RATE_MIN_WINDOW_NS
+# define PAGE_POOL_RATE_MIN_WINDOW_NS (RB_HRTIME_PER_SEC / 10)
+#endif
+#ifndef PAGE_POOL_FLOOR_HALF_LIFE_NS
+# define PAGE_POOL_FLOOR_HALF_LIFE_NS (2 * RB_HRTIME_PER_SEC)
+#endif
+/* A minor GC runs page_pool_reclaim only when something may have become reclaimable and
+ * no reclaim has run for this long. */
+#ifndef PAGE_POOL_MINOR_RECLAIM_INTERVAL_NS
+# define PAGE_POOL_MINOR_RECLAIM_INTERVAL_NS (1 * RB_HRTIME_PER_SEC)
+#endif
+STATIC_ASSERT(page_pool_unmap_after_advise, PAGE_POOL_UNMAP_IDLE_NS >= PAGE_POOL_ADVISE_IDLE_NS);
 
 #ifdef HAVE_MMAP
 /* mmap a new arena to carve from.  Called with the pool lock held, at which point the
@@ -2687,7 +2723,9 @@ page_pool_add_arena(rb_global_objspace_t *g)
     arena->cold_freelist = NULL;
     arena->free_count = 0;
     arena->cold_count = 0;
-    arena->aged_count = 0;
+    arena->advised_count = 0;
+    arena->has_warm = false;
+    arena->newest_free_since = 0;
     arena->next = g->page_pool.arenas;
     g->page_pool.arenas = arena;
     g->page_pool.arena_count++;
@@ -2716,16 +2754,18 @@ page_pool_acquire(struct page_arena **arena_out)
             if (a->cold_count > 0) {
                 body = a->cold_freelist;
                 asan_unpoison_memory_region(body, PAGE_POOL_SCRATCH_SIZE, false);
-                uintptr_t link = *(uintptr_t *)body;
+                uintptr_t link = ((struct page_pool_free_body *)body)->link;
                 a->cold_freelist = PAGE_POOL_LINK_NEXT(link);
                 a->cold_count--;
-                if (PAGE_POOL_LINK_AGE(link) >= PAGE_POOL_RECLAIM_AGE) a->aged_count--;
                 a->free_count--;
                 GC_ASSERT(g->page_pool.free_count_total > 0);
                 g->page_pool.free_count_total--;
                 *arena_out = a;
                 need_reuse = (link & PAGE_POOL_ADVISED_BIT) != 0;
-                if (need_reuse) g->page_pool.advised_count--;
+                if (need_reuse) {
+                    a->advised_count--;
+                    g->page_pool.advised_count--;
+                }
                 break;
             }
         }
@@ -2737,7 +2777,7 @@ page_pool_acquire(struct page_arena **arena_out)
             g->page_pool.arena_cursor += HEAP_PAGE_SIZE;
             *arena_out = g->page_pool.arena_current;
         }
-        if (body != NULL) g->page_pool.acquired_since_reclaim++;
+        if (body != NULL) g->page_pool.acquired_in_window++;
         rb_native_mutex_unlock(&g->page_pool.lock);
 
         if (body != NULL) {
@@ -2758,21 +2798,31 @@ page_pool_acquire(struct page_arena **arena_out)
 }
 
 #ifdef HAVE_MMAP
+/* now is rb_hrtime_now() read while holding the pool lock, so free_since stamps never
+ * decrease along an arena's freelist. */
 static void
-page_pool_release_locked(struct heap_page_body *body, struct page_arena *arena)
+page_pool_release_locked(struct heap_page_body *body, struct page_arena *arena, rb_hrtime_t now)
 {
     rb_global_objspace_t *g = global_objspace;
+    struct page_pool_free_body *fb = (struct page_pool_free_body *)body;
 
     ASSERT_PAGE_POOL_LOCKED(g);
 
     /* A body in the empty-pages pool stays fully poisoned (see gc_sweep_page), so
-     * unpoison the link word before writing. */
+     * unpoison the scratch words before writing. */
     asan_unpoison_memory_region(body, PAGE_POOL_SCRATCH_SIZE, false);
     arena->free_count++;
     g->page_pool.free_count_total++;
-    *(uintptr_t *)body = (uintptr_t)arena->cold_freelist;
+    fb->link = (uintptr_t)arena->cold_freelist;
+    fb->free_since = now;
     arena->cold_freelist = body;
     arena->cold_count++;
+    GC_ASSERT(now >= arena->newest_free_since);
+    arena->newest_free_since = now;
+    rb_hrtime_t due = rb_hrtime_add(now, PAGE_POOL_ADVISE_IDLE_NS);
+    if (due < ATOMIC_U64_LOAD_RELAXED(g->page_pool.next_due)) {
+        ATOMIC_U64_SET_RELAXED(g->page_pool.next_due, due);
+    }
     asan_poison_memory_region(body, HEAP_PAGE_SIZE);
 }
 #endif
@@ -2785,7 +2835,7 @@ page_pool_release(struct heap_page_body *body, struct page_arena *arena)
         rb_global_objspace_t *g = global_objspace;
 
         rb_native_mutex_lock(&g->page_pool.lock);
-        page_pool_release_locked(body, arena);
+        page_pool_release_locked(body, arena, rb_hrtime_now());
         rb_native_mutex_unlock(&g->page_pool.lock);
 #endif
     }
@@ -2794,18 +2844,106 @@ page_pool_release(struct heap_page_body *body, struct page_arena *arena)
     }
 }
 
-/* Allow the OS to reclaim pool memory. Runs at any local non-postmortem major GC (see
- * gc_sweep_finish), once after a global GC's sweep (see gc_start_global), and
- * after a dead Ractor's objspace is absorbed (see objspace_absorb).
+#ifdef HAVE_MMAP
+/* 2^(-i/16) in 16.16 fixed point, for i = 0..16. */
+static const uint32_t page_pool_exp2_neg_sixteenths[17] = {
+    65536, 62757, 60097, 57549, 55109, 52773, 50535, 48393, 46341,
+    44376, 42495, 40693, 38968, 37316, 35734, 34219, 32768,
+};
+
+/* value * 2^(-elapsed / PAGE_POOL_FLOOR_HALF_LIFE_NS), in integer math: whole half-lives
+ * by shifting, the remainder by interpolating page_pool_exp2_neg_sixteenths. */
+static size_t
+page_pool_decay(size_t value, rb_hrtime_t elapsed)
+{
+    const rb_hrtime_t h = PAGE_POOL_FLOOR_HALF_LIFE_NS;
+    rb_hrtime_t halvings = elapsed / h;
+    if (halvings >= sizeof(size_t) * CHAR_BIT) return 0;
+    value >>= halvings;
+
+    uint64_t x = (uint64_t)(elapsed % h) * 16;
+    unsigned int i = (unsigned int)(x / h);
+    uint64_t t = (x % h) * 65536 / h;
+    uint64_t lo = page_pool_exp2_neg_sixteenths[i], hi = page_pool_exp2_neg_sixteenths[i + 1];
+    uint64_t mult = lo - (((lo - hi) * t) >> 16);
+    return (size_t)(((uint64_t)value * mult) >> 16);
+}
+
+/* Size the warm floor from the pool-wide acquire rate: the bodies that rate would
+ * consume in one PAGE_POOL_ADVISE_IDLE_NS, so a workload that keeps refilling its heaps
+ * keeps that many bodies resident.  It rises to new demand at once and halves every
+ * PAGE_POOL_FLOOR_HALF_LIFE_NS without it.  The decay is computed from the time since the
+ * last peak, not compounded per call, so it doesn't depend on how often reclaims run.
+ * Windows shorter than PAGE_POOL_RATE_MIN_WINDOW_NS keep accumulating, so back-to-back
+ * reclaims (several Ractors' GCs, or an absorb right after one) don't produce a rate
+ * spike. */
+static void
+page_pool_update_warm_floor(rb_global_objspace_t *g, rb_hrtime_t now, bool have_clock)
+{
+    ASSERT_PAGE_POOL_LOCKED(g);
+    size_t acquired = g->page_pool.acquired_in_window;
+
+    if (!have_clock) {
+        g->page_pool.warm_floor = acquired;
+        g->page_pool.acquired_in_window = 0;
+        return;
+    }
+
+    rb_hrtime_t dt = rb_hrtime_sub(now, g->page_pool.rate_window_start);
+    if (dt < PAGE_POOL_RATE_MIN_WINDOW_NS) return;
+
+    uint64_t scaled = (uint64_t)acquired > UINT64_MAX / PAGE_POOL_ADVISE_IDLE_NS
+        ? UINT64_MAX : (uint64_t)acquired * PAGE_POOL_ADVISE_IDLE_NS;
+    size_t demand = (size_t)(scaled / dt);
+
+    size_t decayed = page_pool_decay(g->page_pool.warm_peak,
+                                     rb_hrtime_sub(now, g->page_pool.warm_peak_time));
+    if (demand >= decayed) {
+        g->page_pool.warm_peak = demand;
+        g->page_pool.warm_peak_time = now;
+        decayed = demand;
+    }
+    g->page_pool.warm_floor = decayed;
+    g->page_pool.acquired_in_window = 0;
+    g->page_pool.rate_window_start = now;
+}
+
+#endif
+
+/* Whether a minor GC should run page_pool_reclaim: something may have become
+ * reclaimable (see next_due) and no reclaim has run for
+ * PAGE_POOL_MINOR_RECLAIM_INTERVAL_NS.  Lock-free and cheap: one clock read, two loads. */
+static bool
+page_pool_reclaim_due(rb_global_objspace_t *g)
+{
+#ifdef HAVE_MMAP
+    if (!HEAP_PAGE_ALLOC_USE_MMAP) return false;
+    rb_hrtime_t now = rb_hrtime_now();
+    return now >= ATOMIC_U64_LOAD_RELAXED(g->page_pool.next_due) &&
+        rb_hrtime_sub(now, ATOMIC_U64_LOAD_RELAXED(g->page_pool.last_reclaim)) >= PAGE_POOL_MINOR_RECLAIM_INTERVAL_NS;
+#else
+    return false;
+#endif
+}
+
+/* Allow the OS to reclaim pool memory. Runs at any local non-postmortem major GC, at a
+ * minor GC when page_pool_reclaim_due (see gc_sweep_finish), once after a global GC's
+ * sweep (see gc_start_global), and after a dead Ractor's objspace is absorbed (see
+ * objspace_absorb).  Decisions use wall-clock idle time, so they don't depend on how
+ * often reclaims run (which scales with the number of Ractors).
  *
- * Step A: age free bodies and madvise those that reach PAGE_POOL_RECLAIM_AGE, sparing
- * the first OS page (which holds the in-body freelist link).  The first warm_floor
- * bodies in acquire order are left alone (neither aged nor advised): warm_floor is a
- * decaying peak of how many bodies were acquired between reclaims, so a workload that
- * keeps refilling its heaps keeps that many bodies resident.
+ * Step A: madvise free bodies idle for PAGE_POOL_ADVISE_IDLE_NS, sparing the first OS
+ * page (which holds the in-body freelist scratch).  The first warm_floor bodies in
+ * acquire order are left alone: warm_floor is the recent acquire rate x
+ * PAGE_POOL_ADVISE_IDLE_NS, decayed (see page_pool_update_warm_floor), so a workload
+ * that keeps refilling its heaps keeps that many bodies resident.
  *
- * Step B: munmap arenas whose 32 bodies are all free and aged, keeping one extra empty
- * arena as a retention buffer when the remaining free pool is < half an arena. */
+ * Step B: munmap arenas whose 32 bodies are all free, outside the warm floor, and idle
+ * for PAGE_POOL_UNMAP_IDLE_NS, keeping one extra empty arena as a retention buffer when
+ * the remaining free pool is < half an arena.
+ *
+ * Both steps also work out next_due, the earliest time anything left could become
+ * reclaimable, for page_pool_reclaim_due. */
 static void
 page_pool_reclaim(rb_global_objspace_t *g)
 {
@@ -2816,47 +2954,49 @@ page_pool_reclaim(rb_global_objspace_t *g)
     rb_native_mutex_lock(&g->page_pool.lock);
 
     /* Advising spares the first OS page of a body (it holds the in-body freelist
-     * link), so it needs sub-page granularity: when the OS page size is
+     * scratch), so it needs sub-page granularity: when the OS page size is
      * >= HEAP_PAGE_SIZE (e.g. 64KiB pages on aarch64) no body is ever advised, and
      * advised_count must not be adjusted anywhere either. */
     const bool can_advise = os_page_size < HEAP_PAGE_SIZE;
 
-    /* Size the warm floor from the refill rate: jump to the latest interval's demand,
-     * decay by a quarter per reclaim when demand drops. */
-    size_t acquired = g->page_pool.acquired_since_reclaim;
-    size_t decayed = g->page_pool.warm_floor - g->page_pool.warm_floor / 4;
-    g->page_pool.warm_floor = acquired > decayed ? acquired : decayed;
-    g->page_pool.acquired_since_reclaim = 0;
+    /* Without a clock (now == 0), every body outside the warm floor counts as idle. */
+    rb_hrtime_t now = rb_hrtime_now();
+    bool have_clock = now != 0;
+    page_pool_update_warm_floor(g, now, have_clock);
 
-    /* Step A — age cold bodies, advise the old ones.  Walk in acquire order (arenas
-     * newest first, each freelist from its head) so the warm floor covers exactly the
-     * bodies the allocator will hand out next.  Advise lazily (MADV_FREE where
-     * available): the kernel only takes the pages under memory pressure, and a body
-     * reused before then costs no zero-fill fault. */
+    /* Step A — advise idle cold bodies.  Walk in acquire order (arenas newest first,
+     * each freelist from its head) so the warm floor covers exactly the bodies the
+     * allocator will hand out next.  Advise lazily (MADV_FREE where available): the
+     * kernel only takes the pages under memory pressure, and a body reused before then
+     * costs no zero-fill fault. */
     size_t warm_left = g->page_pool.warm_floor;
+    rb_hrtime_t next_due = UINT64_MAX;
+    bool any_warm = false;
     for (struct page_arena *a = g->page_pool.arenas; a; a = a->next) {
+        a->has_warm = false;
         for (struct heap_page_body *body = a->cold_freelist; body; ) {
+            struct page_pool_free_body *fb = (struct page_pool_free_body *)body;
             asan_unpoison_memory_region(body, PAGE_POOL_SCRATCH_SIZE, false);
-            uintptr_t link = *(uintptr_t *)body;
+            uintptr_t link = fb->link;
             struct heap_page_body *next = PAGE_POOL_LINK_NEXT(link);
 
             if (warm_left > 0) {
                 warm_left--;
+                a->has_warm = true;
+                any_warm = true;
             }
-            else {
-                uintptr_t age = PAGE_POOL_LINK_AGE(link);
-                if (age < PAGE_POOL_RECLAIM_AGE) {
-                    age++;
-                    link = (link & ~PAGE_POOL_AGE_MASK) | (age << PAGE_POOL_AGE_SHIFT);
-                    if (age == PAGE_POOL_RECLAIM_AGE) a->aged_count++;
-                }
-                if (age >= PAGE_POOL_RECLAIM_AGE && can_advise && !(link & PAGE_POOL_ADVISED_BIT)) {
+            else if (can_advise && !(link & PAGE_POOL_ADVISED_BIT)) {
+                rb_hrtime_t due = rb_hrtime_add(fb->free_since, PAGE_POOL_ADVISE_IDLE_NS);
+                if (!have_clock || now >= due) {
                     rb_vm_map_reusable_lazy((char *)body + os_page_size,
                                             HEAP_PAGE_SIZE - os_page_size, 0);
-                    link |= PAGE_POOL_ADVISED_BIT;
+                    fb->link = link | PAGE_POOL_ADVISED_BIT;
+                    a->advised_count++;
                     g->page_pool.advised_count++;
                 }
-                *(uintptr_t *)body = link;
+                else if (due < next_due) {
+                    next_due = due;
+                }
             }
             asan_poison_memory_region(body, PAGE_POOL_SCRATCH_SIZE);
             body = next;
@@ -2867,14 +3007,22 @@ page_pool_reclaim(rb_global_objspace_t *g)
      *
      * total_free = Σ free_count (every free body is on its arena's cold freelist,
      * since page_pool_release pushes there unconditionally).  An arena is eligible
-     * when all 32 of its bodies are free and aged.  Keep one extra empty arena when the
-     * rest of the free pool is < half an arena, to avoid thrash. */
+     * when all 32 of its bodies are free, none is inside the warm floor, and the last
+     * of them was released PAGE_POOL_UNMAP_IDLE_NS ago.  Keep one extra empty arena
+     * when the rest of the free pool is < half an arena, to avoid thrash. */
     int total_free = 0;
+#if RGENGC_CHECK_MODE
+    int total_advised = 0;
+#endif
     for (struct page_arena *a = g->page_pool.arenas; a; a = a->next) {
         total_free += a->free_count;
+#if RGENGC_CHECK_MODE
+        total_advised += a->advised_count;
+#endif
     }
 #if RGENGC_CHECK_MODE
     GC_ASSERT((size_t)total_free == g->page_pool.free_count_total);
+    GC_ASSERT(total_advised == g->page_pool.advised_count);
 #endif
 
     bool retained_one = false;
@@ -2882,7 +3030,13 @@ page_pool_reclaim(rb_global_objspace_t *g)
     // munmap fully free arenas
     while (*pp) {
         struct page_arena *a = *pp;
-        if (a->free_count != PAGE_POOL_ARENA_BODIES || a->aged_count != PAGE_POOL_ARENA_BODIES) {
+        if (a->free_count != PAGE_POOL_ARENA_BODIES || a->has_warm) {
+            pp = &a->next;
+            continue;
+        }
+        rb_hrtime_t unmap_due = rb_hrtime_add(a->newest_free_since, PAGE_POOL_UNMAP_IDLE_NS);
+        if (have_clock && now < unmap_due) {
+            if (unmap_due < next_due) next_due = unmap_due;
             pp = &a->next;
             continue;
         }
@@ -2901,12 +3055,9 @@ page_pool_reclaim(rb_global_objspace_t *g)
         }
         total_free -= PAGE_POOL_ARENA_BODIES;
         g->page_pool.free_count_total -= PAGE_POOL_ARENA_BODIES;
-        /* Every body of this arena is aged, and Step A advises a body in the same pass
-         * it ages it -- but only if this platform can advise at all. */
-        if (can_advise) {
-            g->page_pool.advised_count -= PAGE_POOL_ARENA_BODIES;
-            GC_ASSERT(g->page_pool.advised_count >= 0);
-        }
+        /* Bodies that sat inside an earlier warm floor may still be unadvised. */
+        g->page_pool.advised_count -= a->advised_count;
+        GC_ASSERT(g->page_pool.advised_count >= 0);
         g->page_pool.arena_count--;
         g->page_pool.arenas_unmapped++;
         if (a == g->page_pool.arena_current) {
@@ -2918,6 +3069,15 @@ page_pool_reclaim(rb_global_objspace_t *g)
         }
         free(a);
     }
+
+    /* Bodies held by the warm floor become reclaimable as it decays; look again then. */
+    if (any_warm) {
+        rb_hrtime_t warm_due = rb_hrtime_add(now, PAGE_POOL_FLOOR_HALF_LIFE_NS);
+        if (warm_due < next_due) next_due = warm_due;
+    }
+    /* Without a clock, minor GCs never trigger a reclaim. */
+    ATOMIC_U64_SET_RELAXED(g->page_pool.next_due, have_clock ? next_due : UINT64_MAX);
+    ATOMIC_U64_SET_RELAXED(g->page_pool.last_reclaim, now);
 
     rb_native_mutex_unlock(&g->page_pool.lock);
 #endif
@@ -5689,10 +5849,12 @@ gc_sweep_finish(rb_objspace_t *objspace)
 
     gc_prof_set_heap_info(objspace);
     heap_pages_free_unused_pages(objspace);
-    if (is_full_marking(objspace) && !objspace->flags.during_global_gc &&
-        !objspace->flags.during_postmortem) {
+    if (!objspace->flags.during_global_gc && !objspace->flags.during_postmortem &&
+        (is_full_marking(objspace) || page_pool_reclaim_due(global_objspace))) {
         /* gc_marks_finish retains ~2/3 of empty pages in objspace->empty_pages for reuse,
-         * only the excess reaches the pool.  A global GC suppresses this per-objspace
+         * only the excess reaches the pool.  A minor GC reclaims only when something may
+         * be reclaimable and the last reclaim was a while ago, so pages it frees aren't
+         * left resident until the next major GC.  A global GC suppresses this per-objspace
          * reclaim; gc_start_global runs a single reclaim after its sweep instead.  A
          * postmortem GC suppresses it too; absorbing the dead Ractor's objspace runs one
          * reclaim after its pages have been returned to the pool. */
@@ -10279,8 +10441,8 @@ objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
         heap_pages_free_unused_pages(objspace);
     }
 
-    /* A dead Ractor's teardown just piled bodies into the pool; start aging them now
-     * rather than waiting for the next major GC.  Absorb holds the VM lock
+    /* A dead Ractor's teardown just piled bodies into the pool; let reclaim advise or
+     * unmap what has been idle long enough now rather than waiting for the next major GC.  Absorb holds the VM lock
      * but no barrier; page_pool_reclaim is self-locking. */
     page_pool_reclaim(global_objspace);
 
@@ -11038,6 +11200,7 @@ enum gc_stat_sym {
     gc_stat_sym_page_pool_total_pages,
     gc_stat_sym_page_pool_discarded_pages,
     gc_stat_sym_page_pool_free_pages,
+    gc_stat_sym_page_pool_warm_floor,
     gc_stat_sym_last
 };
 
@@ -11095,6 +11258,7 @@ setup_gc_stat_symbols(void)
     S(page_pool_total_pages);
     S(page_pool_discarded_pages);
     S(page_pool_free_pages);
+    S(page_pool_warm_floor);
 #undef S
 }
 
@@ -11255,6 +11419,7 @@ rb_gc_impl_stat(void *objspace_ptr, VALUE hash_or_sym)
     SET(page_pool_total_pages, (size_t)global_objspace->page_pool.arena_count * PAGE_POOL_ARENA_BODIES);
     SET(page_pool_discarded_pages, global_objspace->page_pool.advised_count);
     SET(page_pool_free_pages, global_objspace->page_pool.free_count_total);
+    SET(page_pool_warm_floor, global_objspace->page_pool.warm_floor);
 
 #if RGENGC_PROFILE
     SET(total_generated_normal_object_count, objspace->profile.total_generated_normal_object_count);

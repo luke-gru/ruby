@@ -43,36 +43,54 @@
 
 #ifdef BUILDING_MODULAR_GC
 /* hrtime.h transitively includes internal/time.h -> internal/bits.h, which are
- * not available to out-of-tree modular GC builds.  We only use a monotonic
- * clock plus saturating add/sub, so provide that subset locally with the same
- * semantics as hrtime.h. */
+ * not available to out-of-tree modular GC builds.  We only use a clock plus
+ * saturating add/sub and a msec conversion, so provide that subset locally with the
+ * same semantics as hrtime.h. */
 # include <time.h>
 typedef uint64_t rb_hrtime_t;
-# define RB_HRTIME_PER_SEC ((rb_hrtime_t)1000000000)
+# define RB_HRTIME_PER_MSEC ((rb_hrtime_t)1000000)
+# define RB_HRTIME_PER_SEC  ((rb_hrtime_t)1000000000)
+# define RB_HRTIME_MAX      UINT64_MAX
 
+/* Like thread.c's rb_hrtime_now: monotonic where the platform has it, else a wall clock
+ * that may step backwards.  Callers that need a non-decreasing stamp clamp it (see
+ * page_pool_now).  Always returns a usable value, so there is no no-clock case. */
 static inline rb_hrtime_t
 rb_hrtime_now(void)
 {
-# if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
+# ifdef HAVE_CLOCK_GETTIME
     struct timespec ts;
+#  ifdef CLOCK_MONOTONIC
     if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
         return (rb_hrtime_t)ts.tv_sec * RB_HRTIME_PER_SEC + (rb_hrtime_t)ts.tv_nsec;
     }
+#  endif
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
+        return (rb_hrtime_t)ts.tv_sec * RB_HRTIME_PER_SEC + (rb_hrtime_t)ts.tv_nsec;
+    }
 # endif
-    return 0;
+    return (rb_hrtime_t)time(NULL) * RB_HRTIME_PER_SEC;
 }
 
 static inline rb_hrtime_t
 rb_hrtime_add(rb_hrtime_t a, rb_hrtime_t b)
 {
     rb_hrtime_t c = a + b;
-    return c < a ? UINT64_MAX : c; /* saturate on overflow */
+    return c < a ? RB_HRTIME_MAX : c; /* saturate on overflow */
 }
 
 static inline rb_hrtime_t
 rb_hrtime_sub(rb_hrtime_t a, rb_hrtime_t b)
 {
     return a < b ? 0 : a - b;
+}
+
+/* Saturating, like hrtime.h's rb_hrtime_mul. */
+static inline rb_hrtime_t
+rb_msec2hrtime(unsigned long msec)
+{
+    rb_hrtime_t a = (rb_hrtime_t)msec;
+    return a > RB_HRTIME_MAX / RB_HRTIME_PER_MSEC ? RB_HRTIME_MAX : a * RB_HRTIME_PER_MSEC;
 }
 #else
 # include "hrtime.h"
@@ -847,27 +865,30 @@ typedef struct rb_global_objspace {
             struct page_arena *next;
             char *start;                  /* usable area, HEAP_PAGE_ALIGN aligned */
             size_t size;                  /* usable bytes (a multiple of HEAP_PAGE_SIZE) */
-            struct heap_page_body *cold_freelist; /* free bodies of this arena; link at body offset 0 */
-            int free_count;               /* bodies of this arena currently free (on cold_freelist) */
-            int cold_count;               /* bodies on cold_freelist (subset of free_count) */
-            int advised_count;            /* free bodies of this arena with PAGE_POOL_ADVISED_BIT set */
-            bool has_warm;                /* a body of this arena fell inside the warm floor this reclaim */
-            rb_hrtime_t newest_free_since; /* free_since of the latest release into this arena */
+            struct heap_page_body *cold_freelist; /* free bodies; link at body offset 0 */
+            int free_count;               /* bodies on cold_freelist */
+            int advised_count;            /* free bodies with PAGE_POOL_ADVISED_BIT set */
+            bool has_warm;                /* a body fell inside the warm floor this reclaim */
+            rb_hrtime_t newest_free_since; /* free_since of the latest release here */
         } *arenas;                        /* every arena, newest first */
         char *arena_cursor;               /* first body not yet carved out of the newest arena */
         char *arena_end;                  /* end of current arena */
         struct page_arena *arena_current; /* arena that arena_cursor carves from */
         int arena_count;                  /* current mapped arenas (for GC.stat total_pages) */
-        int advised_count;                /* page bodies with MADV_* applied (for GC.stat discarded pages) */
+        int advised_count;                /* bodies with MADV_* applied (GC.stat discarded pages) */
         size_t arenas_unmapped;           /* cumulative arenas munmapped (for GC.stat) */
         size_t acquired_in_window;        /* bodies handed out since rate_window_start */
         rb_hrtime_t rate_window_start;    /* start of the current acquire-rate window */
-        size_t warm_floor;                /* free bodies page_pool_reclaim keeps warm (acquire rate x PAGE_POOL_ADVISE_IDLE_NS, decayed) */
+        size_t warm_floor;                /* free bodies page_pool_reclaim keeps warm */
         size_t warm_peak;                 /* warm_floor decays from this value ... */
         rb_hrtime_t warm_peak_time;       /* ... set at this time */
-        /* Read without the lock by page_pool_reclaim_due (minor GCs), so accessed atomically. */
+        /* rb_hrtime_now() is not guaranteed monotonic (thread.c falls back to the wall
+         * clock), so every pool timestamp comes from page_pool_now, which clamps against
+         * this.  Written under the lock. */
+        rb_hrtime_t clock_last;
+        /* Read without the lock by page_pool_reclaim_due, so accessed atomically. */
         rbimpl_atomic_uint64_t last_reclaim; /* when page_pool_reclaim last ran */
-        rbimpl_atomic_uint64_t next_due;     /* earliest time a free body or arena may become reclaimable */
+        rbimpl_atomic_uint64_t next_due;     /* earliest time anything may become reclaimable */
     } page_pool;
 
     /* Zombie pages left after the last global cycle (roughly the live data).  Updated
@@ -956,9 +977,11 @@ static void objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src);
 static struct heap_page_body *page_pool_acquire(struct page_arena **arena_out);
 static void page_pool_release(struct heap_page_body *body, struct page_arena *arena);
 #ifdef HAVE_MMAP
-static void page_pool_release_locked(struct heap_page_body *body, struct page_arena *arena, rb_hrtime_t now);
+static rb_hrtime_t page_pool_now(rb_global_objspace_t *g);
+static void page_pool_release_locked(struct heap_page_body *body, struct page_arena *arena,
+                                     rb_hrtime_t now);
 #endif
-static void page_pool_reclaim(rb_global_objspace_t *g);
+static void page_pool_reclaim(rb_global_objspace_t *g, size_t budget);
 
 #if RGENGC_CHECK_MODE && !defined(_WIN32) && !defined(__wasi__) && defined(HAVE_PTHREAD_H)
 # define PAGE_POOL_LOCK_ERRORCHECK 1
@@ -998,11 +1021,12 @@ global_objspace_init(void)
         g->page_pool.arenas_unmapped = 0;
         g->page_pool.acquired_in_window = 0;
         g->page_pool.rate_window_start = rb_hrtime_now();
+        g->page_pool.clock_last = g->page_pool.rate_window_start;
         g->page_pool.warm_floor = 0;
         g->page_pool.warm_peak = 0;
         g->page_pool.warm_peak_time = g->page_pool.rate_window_start;
         ATOMIC_U64_SET_RELAXED(g->page_pool.last_reclaim, g->page_pool.rate_window_start);
-        ATOMIC_U64_SET_RELAXED(g->page_pool.next_due, UINT64_MAX);
+        ATOMIC_U64_SET_RELAXED(g->page_pool.next_due, RB_HRTIME_MAX);
 #ifdef HAVE_MMAP
         g->page_pool.os_page_size = sysconf(_SC_PAGE_SIZE);
 #else
@@ -2496,7 +2520,8 @@ heap_pages_free_batch(rb_objspace_t *objspace, struct heap_page *pages)
 
     rb_native_mutex_lock(&g->page_pool.lock);
 #ifdef HAVE_MMAP
-    rb_hrtime_t now = rb_hrtime_now();
+    /* One stamp for the whole batch; only read the clock if the pool is actually in use. */
+    rb_hrtime_t now = HEAP_PAGE_ALLOC_USE_MMAP ? page_pool_now(g) : 0;
 #endif
     for (struct heap_page *page = pages; page != NULL; page = page->free_next) {
         global_page_index_remove_locked(page);
@@ -2639,30 +2664,57 @@ struct page_pool_free_body {
 };
 #define PAGE_POOL_SCRATCH_SIZE (sizeof(struct page_pool_free_body))
 STATIC_ASSERT(page_pool_free_body_link_first, offsetof(struct page_pool_free_body, link) == 0);
-STATIC_ASSERT(page_pool_free_body_fits, sizeof(struct page_pool_free_body) <= 4096);
+/* The real bound is page_pool.os_page_size (asserted in page_pool_add_arena); 4096 is
+ * the smallest page size any supported platform reports. */
+STATIC_ASSERT(page_pool_free_body_fits_smallest_page, sizeof(struct page_pool_free_body) <= 4096);
 
 /* page_pool_reclaim advises a free body once it has been idle this long, and munmaps an
- * arena once all its bodies have been free this long.  The warm floor halves every
- * PAGE_POOL_FLOOR_HALF_LIFE_NS without demand; an acquire-rate sample needs a window of
- * at least PAGE_POOL_RATE_MIN_WINDOW_NS. */
+ * arena once all its bodies have been free this long.  Both are overridable at runtime
+ * (RUBY_GC_PAGE_POOL_*_IDLE_MSEC) so tests can drive Step A and Step B without waiting
+ * out the defaults. */
 #ifndef PAGE_POOL_ADVISE_IDLE_NS
 # define PAGE_POOL_ADVISE_IDLE_NS (1 * RB_HRTIME_PER_SEC)
 #endif
 #ifndef PAGE_POOL_UNMAP_IDLE_NS
 # define PAGE_POOL_UNMAP_IDLE_NS (5 * RB_HRTIME_PER_SEC)
 #endif
+STATIC_ASSERT(page_pool_unmap_after_advise, PAGE_POOL_UNMAP_IDLE_NS >= PAGE_POOL_ADVISE_IDLE_NS);
+static rb_hrtime_t page_pool_advise_idle = PAGE_POOL_ADVISE_IDLE_NS;
+static rb_hrtime_t page_pool_unmap_idle = PAGE_POOL_UNMAP_IDLE_NS;
+
+/* The warm floor halves every page_pool_floor_half_life without demand.  An
+ * acquire-rate sample needs a window of at least PAGE_POOL_RATE_MIN_WINDOW_NS, and a
+ * window longer than PAGE_POOL_RATE_MAX_WINDOW_NS is treated as that long: a burst
+ * confined to the tail of a long quiet window would otherwise be averaged away to
+ * nothing.  Clamping over-estimates demand instead, which errs toward keeping bodies
+ * resident. */
 #ifndef PAGE_POOL_RATE_MIN_WINDOW_NS
 # define PAGE_POOL_RATE_MIN_WINDOW_NS (RB_HRTIME_PER_SEC / 10)
+#endif
+#ifndef PAGE_POOL_RATE_MAX_WINDOW_NS
+# define PAGE_POOL_RATE_MAX_WINDOW_NS (4 * RB_HRTIME_PER_SEC)
 #endif
 #ifndef PAGE_POOL_FLOOR_HALF_LIFE_NS
 # define PAGE_POOL_FLOOR_HALF_LIFE_NS (2 * RB_HRTIME_PER_SEC)
 #endif
+STATIC_ASSERT(page_pool_rate_window_ordered,
+              PAGE_POOL_RATE_MAX_WINDOW_NS > PAGE_POOL_RATE_MIN_WINDOW_NS);
+static rb_hrtime_t page_pool_floor_half_life = PAGE_POOL_FLOOR_HALF_LIFE_NS;
+
 /* A minor GC runs page_pool_reclaim only when something may have become reclaimable and
  * no reclaim has run for this long. */
 #ifndef PAGE_POOL_MINOR_RECLAIM_INTERVAL_NS
 # define PAGE_POOL_MINOR_RECLAIM_INTERVAL_NS (1 * RB_HRTIME_PER_SEC)
 #endif
-STATIC_ASSERT(page_pool_unmap_after_advise, PAGE_POOL_UNMAP_IDLE_NS >= PAGE_POOL_ADVISE_IDLE_NS);
+
+/* Cap on the madvise + munmap calls one page_pool_reclaim may issue.  A minor GC takes
+ * PAGE_POOL_MINOR_RECLAIM_BUDGET so a large pool cannot turn a minor pause into a burst
+ * of syscalls; majors, global GCs and absorb are unbounded and drain the rest.  A pass
+ * that runs out leaves next_due at now, so the work resumes at the next opportunity. */
+#define PAGE_POOL_RECLAIM_UNLIMITED SIZE_MAX
+#ifndef PAGE_POOL_MINOR_RECLAIM_BUDGET
+# define PAGE_POOL_MINOR_RECLAIM_BUDGET 64
+#endif
 
 #ifdef HAVE_MMAP
 /* mmap a new arena to carve from.  Called with the pool lock held, at which point the
@@ -2671,6 +2723,9 @@ static bool
 page_pool_add_arena(rb_global_objspace_t *g)
 {
     GC_ASSERT(HEAP_PAGE_ALIGN % sysconf(_SC_PAGE_SIZE) == 0);
+    /* Advising spares a body's first OS page, which must cover the whole in-body
+     * scratch (see struct page_pool_free_body). */
+    GC_ASSERT(g->page_pool.os_page_size >= PAGE_POOL_SCRATCH_SIZE);
 
     size_t mmap_size = PAGE_POOL_ARENA_SIZE + HEAP_PAGE_ALIGN;
     char *ptr = mmap(NULL, mmap_size,
@@ -2722,7 +2777,6 @@ page_pool_add_arena(rb_global_objspace_t *g)
     arena->size = PAGE_POOL_ARENA_SIZE;
     arena->cold_freelist = NULL;
     arena->free_count = 0;
-    arena->cold_count = 0;
     arena->advised_count = 0;
     arena->has_warm = false;
     arena->newest_free_since = 0;
@@ -2751,12 +2805,11 @@ page_pool_acquire(struct page_arena **arena_out)
         rb_native_mutex_lock(&g->page_pool.lock);
         // find cold page body (madvised reusable)
         for (struct page_arena *a = g->page_pool.arenas; a; a = a->next) {
-            if (a->cold_count > 0) {
+            if (a->free_count > 0) {
                 body = a->cold_freelist;
                 asan_unpoison_memory_region(body, PAGE_POOL_SCRATCH_SIZE, false);
                 uintptr_t link = ((struct page_pool_free_body *)body)->link;
                 a->cold_freelist = PAGE_POOL_LINK_NEXT(link);
-                a->cold_count--;
                 a->free_count--;
                 GC_ASSERT(g->page_pool.free_count_total > 0);
                 g->page_pool.free_count_total--;
@@ -2798,8 +2851,25 @@ page_pool_acquire(struct page_arena **arena_out)
 }
 
 #ifdef HAVE_MMAP
-/* now is rb_hrtime_now() read while holding the pool lock, so free_since stamps never
- * decrease along an arena's freelist. */
+/* The pool's clock.  rb_hrtime_now() is monotonic only when the platform has
+ * CLOCK_MONOTONIC; otherwise thread.c falls back to the wall clock, which NTP can step
+ * backwards.  Clamping here buys every timestamp in the pool a single non-decreasing
+ * source, so idle windows can't silently stretch and the newest_free_since ordering
+ * below holds by construction. */
+static rb_hrtime_t
+page_pool_now(rb_global_objspace_t *g)
+{
+    ASSERT_PAGE_POOL_LOCKED(g);
+
+    rb_hrtime_t now = rb_hrtime_now();
+    if (now < g->page_pool.clock_last) {
+        now = g->page_pool.clock_last;
+    }
+    g->page_pool.clock_last = now;
+    return now;
+}
+
+/* now comes from page_pool_now under the pool lock. */
 static void
 page_pool_release_locked(struct heap_page_body *body, struct page_arena *arena, rb_hrtime_t now)
 {
@@ -2816,10 +2886,9 @@ page_pool_release_locked(struct heap_page_body *body, struct page_arena *arena, 
     fb->link = (uintptr_t)arena->cold_freelist;
     fb->free_since = now;
     arena->cold_freelist = body;
-    arena->cold_count++;
     GC_ASSERT(now >= arena->newest_free_since);
     arena->newest_free_since = now;
-    rb_hrtime_t due = rb_hrtime_add(now, PAGE_POOL_ADVISE_IDLE_NS);
+    rb_hrtime_t due = rb_hrtime_add(now, page_pool_advise_idle);
     if (due < ATOMIC_U64_LOAD_RELAXED(g->page_pool.next_due)) {
         ATOMIC_U64_SET_RELAXED(g->page_pool.next_due, due);
     }
@@ -2835,7 +2904,7 @@ page_pool_release(struct heap_page_body *body, struct page_arena *arena)
         rb_global_objspace_t *g = global_objspace;
 
         rb_native_mutex_lock(&g->page_pool.lock);
-        page_pool_release_locked(body, arena, rb_hrtime_now());
+        page_pool_release_locked(body, arena, page_pool_now(g));
         rb_native_mutex_unlock(&g->page_pool.lock);
 #endif
     }
@@ -2851,12 +2920,12 @@ static const uint32_t page_pool_exp2_neg_sixteenths[17] = {
     44376, 42495, 40693, 38968, 37316, 35734, 34219, 32768,
 };
 
-/* value * 2^(-elapsed / PAGE_POOL_FLOOR_HALF_LIFE_NS), in integer math: whole half-lives
+/* value * 2^(-elapsed / page_pool_floor_half_life), in integer math: whole half-lives
  * by shifting, the remainder by interpolating page_pool_exp2_neg_sixteenths. */
 static size_t
 page_pool_decay(size_t value, rb_hrtime_t elapsed)
 {
-    const rb_hrtime_t h = PAGE_POOL_FLOOR_HALF_LIFE_NS;
+    const rb_hrtime_t h = page_pool_floor_half_life;
     rb_hrtime_t halvings = elapsed / h;
     if (halvings >= sizeof(size_t) * CHAR_BIT) return 0;
     value >>= halvings;
@@ -2870,30 +2939,25 @@ page_pool_decay(size_t value, rb_hrtime_t elapsed)
 }
 
 /* Size the warm floor from the pool-wide acquire rate: the bodies that rate would
- * consume in one PAGE_POOL_ADVISE_IDLE_NS, so a workload that keeps refilling its heaps
+ * consume in one page_pool_advise_idle, so a workload that keeps refilling its heaps
  * keeps that many bodies resident.  It rises to new demand at once and halves every
- * PAGE_POOL_FLOOR_HALF_LIFE_NS without it.  The decay is computed from the time since the
+ * page_pool_floor_half_life without it.  The decay is computed from the time since the
  * last peak, not compounded per call, so it doesn't depend on how often reclaims run.
  * Windows shorter than PAGE_POOL_RATE_MIN_WINDOW_NS keep accumulating, so back-to-back
  * reclaims (several Ractors' GCs, or an absorb right after one) don't produce a rate
- * spike. */
+ * spike; windows longer than PAGE_POOL_RATE_MAX_WINDOW_NS are measured as that long. */
 static void
-page_pool_update_warm_floor(rb_global_objspace_t *g, rb_hrtime_t now, bool have_clock)
+page_pool_update_warm_floor(rb_global_objspace_t *g, rb_hrtime_t now)
 {
     ASSERT_PAGE_POOL_LOCKED(g);
     size_t acquired = g->page_pool.acquired_in_window;
 
-    if (!have_clock) {
-        g->page_pool.warm_floor = acquired;
-        g->page_pool.acquired_in_window = 0;
-        return;
-    }
-
     rb_hrtime_t dt = rb_hrtime_sub(now, g->page_pool.rate_window_start);
     if (dt < PAGE_POOL_RATE_MIN_WINDOW_NS) return;
+    if (dt > PAGE_POOL_RATE_MAX_WINDOW_NS) dt = PAGE_POOL_RATE_MAX_WINDOW_NS;
 
-    uint64_t scaled = (uint64_t)acquired > UINT64_MAX / PAGE_POOL_ADVISE_IDLE_NS
-        ? UINT64_MAX : (uint64_t)acquired * PAGE_POOL_ADVISE_IDLE_NS;
+    uint64_t scaled = (uint64_t)acquired > UINT64_MAX / page_pool_advise_idle
+        ? UINT64_MAX : (uint64_t)acquired * page_pool_advise_idle;
     size_t demand = (size_t)(scaled / dt);
 
     size_t decayed = page_pool_decay(g->page_pool.warm_peak,
@@ -2912,15 +2976,17 @@ page_pool_update_warm_floor(rb_global_objspace_t *g, rb_hrtime_t now, bool have_
 
 /* Whether a minor GC should run page_pool_reclaim: something may have become
  * reclaimable (see next_due) and no reclaim has run for
- * PAGE_POOL_MINOR_RECLAIM_INTERVAL_NS.  Lock-free and cheap: one clock read, two loads. */
+ * PAGE_POOL_MINOR_RECLAIM_INTERVAL_NS.  Read without the pool lock, so a backwards
+ * clock step just defers the next pass. */
 static bool
 page_pool_reclaim_due(rb_global_objspace_t *g)
 {
 #ifdef HAVE_MMAP
     if (!HEAP_PAGE_ALLOC_USE_MMAP) return false;
     rb_hrtime_t now = rb_hrtime_now();
+    rb_hrtime_t since = rb_hrtime_sub(now, ATOMIC_U64_LOAD_RELAXED(g->page_pool.last_reclaim));
     return now >= ATOMIC_U64_LOAD_RELAXED(g->page_pool.next_due) &&
-        rb_hrtime_sub(now, ATOMIC_U64_LOAD_RELAXED(g->page_pool.last_reclaim)) >= PAGE_POOL_MINOR_RECLAIM_INTERVAL_NS;
+        since >= PAGE_POOL_MINOR_RECLAIM_INTERVAL_NS;
 #else
     return false;
 #endif
@@ -2929,23 +2995,31 @@ page_pool_reclaim_due(rb_global_objspace_t *g)
 /* Allow the OS to reclaim pool memory. Runs at any local non-postmortem major GC, at a
  * minor GC when page_pool_reclaim_due (see gc_sweep_finish), once after a global GC's
  * sweep (see gc_start_global), and after a dead Ractor's objspace is absorbed (see
- * objspace_absorb).  Decisions use wall-clock idle time, so they don't depend on how
- * often reclaims run (which scales with the number of Ractors).
+ * objspace_absorb).  Decisions use elapsed idle time, so they don't depend on how often
+ * reclaims run (which scales with the number of Ractors).  budget caps the syscalls one
+ * pass may issue (see PAGE_POOL_RECLAIM_UNLIMITED).
  *
- * Step A: madvise free bodies idle for PAGE_POOL_ADVISE_IDLE_NS, sparing the first OS
- * page (which holds the in-body freelist scratch).  The first warm_floor bodies in
- * acquire order are left alone: warm_floor is the recent acquire rate x
- * PAGE_POOL_ADVISE_IDLE_NS, decayed (see page_pool_update_warm_floor), so a workload
- * that keeps refilling its heaps keeps that many bodies resident.
+ * Step A: madvise free bodies idle for page_pool_advise_idle, sparing the first OS page
+ * (which holds the in-body freelist scratch).  The first warm_floor bodies in acquire
+ * order are left alone: warm_floor is the recent acquire rate x page_pool_advise_idle,
+ * decayed (see page_pool_update_warm_floor), so a workload that keeps refilling its
+ * heaps keeps that many bodies resident.
  *
  * Step B: munmap arenas whose 32 bodies are all free, outside the warm floor, and idle
- * for PAGE_POOL_UNMAP_IDLE_NS, keeping one extra empty arena as a retention buffer when
+ * for page_pool_unmap_idle, keeping one extra empty arena as a retention buffer when
  * the remaining free pool is < half an arena.
  *
  * Both steps also work out next_due, the earliest time anything left could become
- * reclaimable, for page_pool_reclaim_due. */
+ * reclaimable, for page_pool_reclaim_due.
+ *
+ * Note on RSS: Step A uses the lazy advice, which is MADV_FREE on Linux -- the kernel
+ * only takes the pages under memory pressure, so RSS does not drop at the madvise and a
+ * body reused before then costs no zero-fill fault.  Step B's munmap is the only
+ * unconditional drop.  (A VM_CHECK_MODE build advises with MADV_DONTNEED instead, which
+ * does drop RSS at once -- so don't read RSS off a debug build and expect a release
+ * build to match.  macOS uses MADV_FREE_REUSABLE either way.) */
 static void
-page_pool_reclaim(rb_global_objspace_t *g)
+page_pool_reclaim(rb_global_objspace_t *g, size_t budget)
 {
     if (!HEAP_PAGE_ALLOC_USE_MMAP) return;
 #ifdef HAVE_MMAP
@@ -2959,19 +3033,17 @@ page_pool_reclaim(rb_global_objspace_t *g)
      * advised_count must not be adjusted anywhere either. */
     const bool can_advise = os_page_size < HEAP_PAGE_SIZE;
 
-    /* Without a clock (now == 0), every body outside the warm floor counts as idle. */
-    rb_hrtime_t now = rb_hrtime_now();
-    bool have_clock = now != 0;
-    page_pool_update_warm_floor(g, now, have_clock);
+    rb_hrtime_t now = page_pool_now(g);
+    page_pool_update_warm_floor(g, now);
 
     /* Step A — advise idle cold bodies.  Walk in acquire order (arenas newest first,
      * each freelist from its head) so the warm floor covers exactly the bodies the
-     * allocator will hand out next.  Advise lazily (MADV_FREE where available): the
-     * kernel only takes the pages under memory pressure, and a body reused before then
-     * costs no zero-fill fault. */
+     * allocator will hand out next.  The walk always completes -- Step B needs every
+     * arena's has_warm -- but an exhausted budget stops the madvise calls. */
     size_t warm_left = g->page_pool.warm_floor;
-    rb_hrtime_t next_due = UINT64_MAX;
+    rb_hrtime_t next_due = RB_HRTIME_MAX;
     bool any_warm = false;
+    bool deferred = false;
     for (struct page_arena *a = g->page_pool.arenas; a; a = a->next) {
         a->has_warm = false;
         for (struct heap_page_body *body = a->cold_freelist; body; ) {
@@ -2986,16 +3058,20 @@ page_pool_reclaim(rb_global_objspace_t *g)
                 any_warm = true;
             }
             else if (can_advise && !(link & PAGE_POOL_ADVISED_BIT)) {
-                rb_hrtime_t due = rb_hrtime_add(fb->free_since, PAGE_POOL_ADVISE_IDLE_NS);
-                if (!have_clock || now >= due) {
+                rb_hrtime_t due = rb_hrtime_add(fb->free_since, page_pool_advise_idle);
+                if (now < due) {
+                    if (due < next_due) next_due = due;
+                }
+                else if (budget == 0) {
+                    deferred = true;
+                }
+                else {
+                    budget--;
                     rb_vm_map_reusable_lazy((char *)body + os_page_size,
                                             HEAP_PAGE_SIZE - os_page_size, 0);
                     fb->link = link | PAGE_POOL_ADVISED_BIT;
                     a->advised_count++;
                     g->page_pool.advised_count++;
-                }
-                else if (due < next_due) {
-                    next_due = due;
                 }
             }
             asan_poison_memory_region(body, PAGE_POOL_SCRATCH_SIZE);
@@ -3008,7 +3084,7 @@ page_pool_reclaim(rb_global_objspace_t *g)
      * total_free = Σ free_count (every free body is on its arena's cold freelist,
      * since page_pool_release pushes there unconditionally).  An arena is eligible
      * when all 32 of its bodies are free, none is inside the warm floor, and the last
-     * of them was released PAGE_POOL_UNMAP_IDLE_NS ago.  Keep one extra empty arena
+     * of them was released page_pool_unmap_idle ago.  Keep one extra empty arena
      * when the rest of the free pool is < half an arena, to avoid thrash. */
     int total_free = 0;
 #if RGENGC_CHECK_MODE
@@ -3034,13 +3110,17 @@ page_pool_reclaim(rb_global_objspace_t *g)
             pp = &a->next;
             continue;
         }
-        rb_hrtime_t unmap_due = rb_hrtime_add(a->newest_free_since, PAGE_POOL_UNMAP_IDLE_NS);
-        if (have_clock && now < unmap_due) {
+        rb_hrtime_t unmap_due = rb_hrtime_add(a->newest_free_since, page_pool_unmap_idle);
+        if (now < unmap_due) {
             if (unmap_due < next_due) next_due = unmap_due;
             pp = &a->next;
             continue;
         }
-        GC_ASSERT(a->cold_count == PAGE_POOL_ARENA_BODIES);
+        if (budget == 0) {
+            deferred = true;
+            pp = &a->next;
+            continue;
+        }
 
         int free_elsewhere = total_free - PAGE_POOL_ARENA_BODIES;
         if (free_elsewhere < PAGE_POOL_ARENA_KEEP_HALF && !retained_one) {
@@ -3049,6 +3129,7 @@ page_pool_reclaim(rb_global_objspace_t *g)
             continue;
         }
 
+        budget--;
         *pp = a->next;
         if (munmap(a->start, a->size)) {
             rb_bug("page_pool_reclaim: munmap failed");
@@ -3072,11 +3153,12 @@ page_pool_reclaim(rb_global_objspace_t *g)
 
     /* Bodies held by the warm floor become reclaimable as it decays; look again then. */
     if (any_warm) {
-        rb_hrtime_t warm_due = rb_hrtime_add(now, PAGE_POOL_FLOOR_HALF_LIFE_NS);
+        rb_hrtime_t warm_due = rb_hrtime_add(now, page_pool_floor_half_life);
         if (warm_due < next_due) next_due = warm_due;
     }
-    /* Without a clock, minor GCs never trigger a reclaim. */
-    ATOMIC_U64_SET_RELAXED(g->page_pool.next_due, have_clock ? next_due : UINT64_MAX);
+    /* Work the budget cut short is due now; the minor-GC interval still paces it. */
+    if (deferred) next_due = now;
+    ATOMIC_U64_SET_RELAXED(g->page_pool.next_due, next_due);
     ATOMIC_U64_SET_RELAXED(g->page_pool.last_reclaim, now);
 
     rb_native_mutex_unlock(&g->page_pool.lock);
@@ -5849,16 +5931,21 @@ gc_sweep_finish(rb_objspace_t *objspace)
 
     gc_prof_set_heap_info(objspace);
     heap_pages_free_unused_pages(objspace);
-    if (!objspace->flags.during_global_gc && !objspace->flags.during_postmortem &&
-        (is_full_marking(objspace) || page_pool_reclaim_due(global_objspace))) {
+    if (!objspace->flags.during_global_gc && !objspace->flags.during_postmortem) {
         /* gc_marks_finish retains ~2/3 of empty pages in objspace->empty_pages for reuse,
          * only the excess reaches the pool.  A minor GC reclaims only when something may
          * be reclaimable and the last reclaim was a while ago, so pages it frees aren't
-         * left resident until the next major GC.  A global GC suppresses this per-objspace
-         * reclaim; gc_start_global runs a single reclaim after its sweep instead.  A
-         * postmortem GC suppresses it too; absorbing the dead Ractor's objspace runs one
-         * reclaim after its pages have been returned to the pool. */
-        page_pool_reclaim(global_objspace);
+         * left resident until the next major GC -- on a budget, since a large pool would
+         * otherwise put a burst of syscalls in a minor pause.  A global GC suppresses this
+         * per-objspace reclaim; gc_start_global runs a single reclaim after its sweep
+         * instead.  A postmortem GC suppresses it too; absorbing the dead Ractor's
+         * objspace runs one reclaim after its pages have been returned to the pool. */
+        if (is_full_marking(objspace)) {
+            page_pool_reclaim(global_objspace, PAGE_POOL_RECLAIM_UNLIMITED);
+        }
+        else if (page_pool_reclaim_due(global_objspace)) {
+            page_pool_reclaim(global_objspace, PAGE_POOL_MINOR_RECLAIM_BUDGET);
+        }
     }
 
     for (int i = 0; i < HEAP_COUNT; i++) {
@@ -10080,7 +10167,7 @@ gc_start_global(rb_objspace_t *driver, unsigned int reason, bool compact, bool a
         os->heap_pages.freeable_pages = objspace_post_sweep_freeable_pages(os);
         heap_pages_free_unused_pages(os);
     }
-    page_pool_reclaim(global_objspace);
+    page_pool_reclaim(global_objspace, PAGE_POOL_RECLAIM_UNLIMITED);
 
     /* A global GC never calls gc_marks_finish, which budgets heap growth
      * (allocatable_bytes).  An objspace still full after the global sweep (materializing
@@ -10442,9 +10529,10 @@ objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
     }
 
     /* A dead Ractor's teardown just piled bodies into the pool; let reclaim advise or
-     * unmap what has been idle long enough now rather than waiting for the next major GC.  Absorb holds the VM lock
-     * but no barrier; page_pool_reclaim is self-locking. */
-    page_pool_reclaim(global_objspace);
+     * unmap whatever has been idle long enough now, rather than waiting for the next
+     * major GC.  Absorb holds the VM lock but no barrier; page_pool_reclaim is
+     * self-locking. */
+    page_pool_reclaim(global_objspace, PAGE_POOL_RECLAIM_UNLIMITED);
 
     global_objspace->during_absorb = prev_absorb;
 }
@@ -11798,6 +11886,24 @@ rb_gc_impl_set_params(void *objspace_ptr)
     get_envparam_size  ("RUBY_GC_OLDMALLOC_LIMIT_MAX", &gc_params.oldmalloc_limit_max, 0);
     get_envparam_double("RUBY_GC_OLDMALLOC_LIMIT_GROWTH_FACTOR", &gc_params.oldmalloc_limit_growth_factor, 1.0, 0.0, FALSE);
 #endif
+
+    /* get_envparam_size rejects 0, so these are in msec: 1 is near enough to "no wait"
+     * for a test that wants to drive page_pool_reclaim's two steps. */
+    size_t msec = (size_t)(page_pool_advise_idle / RB_HRTIME_PER_MSEC);
+    if (get_envparam_size("RUBY_GC_PAGE_POOL_ADVISE_IDLE_MSEC", &msec, 0)) {
+        page_pool_advise_idle = rb_msec2hrtime(msec);
+    }
+    msec = (size_t)(page_pool_unmap_idle / RB_HRTIME_PER_MSEC);
+    if (get_envparam_size("RUBY_GC_PAGE_POOL_UNMAP_IDLE_MSEC", &msec, 0)) {
+        page_pool_unmap_idle = rb_msec2hrtime(msec);
+    }
+    msec = (size_t)(page_pool_floor_half_life / RB_HRTIME_PER_MSEC);
+    if (get_envparam_size("RUBY_GC_PAGE_POOL_FLOOR_HALF_LIFE_MSEC", &msec, 0)) {
+        page_pool_floor_half_life = rb_msec2hrtime(msec);
+    }
+    if (page_pool_unmap_idle < page_pool_advise_idle) {
+        page_pool_unmap_idle = page_pool_advise_idle;
+    }
 }
 
 static inline size_t

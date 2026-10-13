@@ -311,18 +311,39 @@ class TestGc < Test::Unit::TestCase
     retry
   end
 
+  # The page pool's reclaim gates are generous by default -- a body must sit idle 1s
+  # before it is advised, an arena 5s before it is unmapped, and the warm floor (the
+  # recent acquire rate x the advise window) halves every 2s.  A test that allocates and
+  # frees in well under a second reaches neither step, so each test below drives the
+  # gates it needs down to milliseconds.
   def test_page_pool_stat_consistency
     omit 'no page pool' unless GC.stat.key?(:page_pool_total_pages)
 
     # Freeing arenas back to the OS must keep page_pool_discarded_pages in range.
     # An underflowed counter wraps to a huge value, which also makes GC.stat
     # allocate a Bignum and perturb the object counts it reports.
-    assert_separately([], __FILE__, __LINE__, <<~RUBY, timeout: 60)
-      3.times do
-        ary = 200_000.times.map { "x" * 40 }
+    assert_separately([{"RUBY_GC_PAGE_POOL_ADVISE_IDLE_MSEC" => "1",
+                        "RUBY_GC_PAGE_POOL_UNMAP_IDLE_MSEC" => "1",
+                        "RUBY_GC_PAGE_POOL_FLOOR_HALF_LIFE_MSEC" => "1"},
+                       # -W0 after the -w assert_separately injects: the GC param echo
+                       # would otherwise land on stderr and fail the run.
+                       "-W0"],
+                      __FILE__, __LINE__, <<~RUBY, timeout: 60)
+      # Only pages a heap has in excess of its own empty_pages tier reach the pool, and
+      # Step B needs a whole 2MiB arena free at once, so the heap has to grow and shrink
+      # by a good margin.  Escalate until it does rather than hardcoding a size.
+      freed = 0
+      3.times do |i|
+        ary = (200_000 * (i + 1)).times.map { "x" * 40 }
         ary.clear
+        ary = nil
+        # Fills the pool during sweep.  Consecutive GCs here run well inside 1ms, so wait
+        # past the idle gates before the reclaim that has to do the work.
         GC.start(full_mark: true, immediate_sweep: true)
+        sleep 0.05
         GC.start(full_mark: true, immediate_sweep: true)
+        freed = GC.stat(:page_pool_arenas_freed)
+        break if freed > 0
       end
 
       stat = GC.stat
@@ -330,6 +351,45 @@ class TestGc < Test::Unit::TestCase
       # Free bodies in the pool can never exceed the total pages ever retained.
       assert_operator stat[:page_pool_free_pages], :<=, stat[:page_pool_total_pages]
       assert_operator stat[:page_pool_arenas], :>=, 0 # arenas is always 0 if doesn't have mmap
+      # The range assertions above say nothing about arena freeing unless Step B ran.
+      omit 'heap never freed a whole arena' if freed == 0
+    RUBY
+  end
+
+  def test_page_pool_warm_floor
+    omit 'no page pool' unless GC.stat.key?(:page_pool_warm_floor)
+
+    # A workload that keeps taking bodies from the pool must keep a warm floor, and the
+    # floor must decay back to nothing once the demand stops.  The advise window stays
+    # comparatively long here: the floor is the acquire rate scaled by it, so a 1ms
+    # window would round the floor down to single digits.
+    assert_separately([{"RUBY_GC_PAGE_POOL_ADVISE_IDLE_MSEC" => "100",
+                        "RUBY_GC_PAGE_POOL_UNMAP_IDLE_MSEC" => "100",
+                        "RUBY_GC_PAGE_POOL_FLOOR_HALF_LIFE_MSEC" => "50"}, "-W0"],
+                      __FILE__, __LINE__, <<~RUBY, timeout: 60)
+      # The acquire rate is only recomputed once the 100ms rate window closes, so keep
+      # churning well past that.
+      busy = 0
+      6.times do
+        ary = 400_000.times.map { "x" * 40 }
+        ary.clear
+        ary = nil
+        GC.start(full_mark: true, immediate_sweep: true)
+        busy = [busy, GC.stat(:page_pool_warm_floor)].max
+      end
+      assert_operator busy, :>, 0, "acquiring from the pool should build a warm floor"
+
+      # The floor is only recomputed by a reclaim, and the GC that triggers one can itself
+      # take a few bodies from the pool -- fresh demand that holds the floor just above
+      # zero for a cycle.  So idle repeatedly until it bottoms out.
+      idle = nil
+      5.times do
+        sleep 0.2
+        GC.start(full_mark: true, immediate_sweep: true)
+        idle = GC.stat(:page_pool_warm_floor)
+        break if idle == 0
+      end
+      assert_equal 0, idle, "the floor should decay away once pool demand stops"
     RUBY
   end
 

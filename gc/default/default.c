@@ -19,6 +19,7 @@
 
 #ifdef BUILDING_MODULAR_GC
 # define nlz_int64(x) (x == 0 ? 64 : (unsigned int)__builtin_clzll((unsigned long long)x))
+# define ntz_int64(x) (x == 0 ? 64 : (unsigned int)__builtin_ctzll((unsigned long long)x))
 # define rb_popcount_intptr(x) ((unsigned int)__builtin_popcountll((unsigned long long)(x)))
 #else
 # include "internal/bits.h"
@@ -2723,7 +2724,10 @@ struct page_arena {
     int free_count;               /* bodies on cold_freelist */
     int advised_count;            /* free bodies with bodies[].advised set */
     bool has_warm;                /* a body fell inside the warm floor this reclaim */
-    rb_hrtime_t newest_free_since; /* free_since of the latest release here */
+    /* The cold freelist is LIFO and page_pool_now is monotonic, so free_since descends
+     * from its head: these two bracket every free body in the arena. */
+    rb_hrtime_t newest_free_since; /* free_since of the head (the latest release here) */
+    rb_hrtime_t oldest_free_since; /* free_since of the tail; only valid while free_count > 0 */
     struct page_pool_body_info bodies[PAGE_POOL_ARENA_BODIES];
 };
 STATIC_ASSERT(page_pool_body_index_fits_int8, PAGE_POOL_ARENA_BODIES <= INT8_MAX);
@@ -2934,6 +2938,7 @@ page_pool_add_arena(rb_global_objspace_t *g)
     arena->advised_count = 0;
     arena->has_warm = false;
     arena->newest_free_since = 0;
+    arena->oldest_free_since = 0;
     arena->next = g->page_pool.arenas;
     g->page_pool.arenas = arena;
     g->page_pool.arena_count++;
@@ -3112,6 +3117,9 @@ page_pool_release_locked(struct heap_page_body *body, struct page_arena *arena, 
     int i = page_pool_body_index(arena, body);
     struct page_pool_body_info *info = &arena->bodies[i];
 
+    if (arena->free_count == 0) {
+        arena->oldest_free_since = now;
+    }
     arena->free_count++;
     g->page_pool.free_count_total++;
     info->next = arena->cold_freelist;
@@ -3213,17 +3221,52 @@ page_pool_reclaim(rb_global_objspace_t *g, size_t budget)
      * (arenas newest first, each freelist from its head) so the warm floor covers
      * exactly the bodies the allocator will hand out next; the bodies it picks are then
      * advised in address order, one call per run of physically adjacent ones, so a fully
-     * free arena costs one madvise instead of 32.  The walk always completes -- Step B
-     * needs every arena's has_warm -- but an exhausted budget stops the marking.  budget
-     * is charged per body, so the calls issued can only undershoot it. */
+     * free arena costs one madvise instead of 32.  An exhausted budget stops the marking
+     * but not the walk; budget is charged per body, so the calls issued can only
+     * undershoot it. */
     size_t warm_left = page_pool_warm_floor(g, now);
     rb_hrtime_t next_due = RB_HRTIME_MAX;
     bool any_warm = false;
     bool deferred = false;
+
+    /* Nothing to walk for.  With nothing free neither step has anything to look at, and
+     * only a release can change that -- it lowers next_due itself.  With the floor over
+     * the whole free pool nothing can be advised and no arena unmapped (Step B skips a
+     * warm arena), so a walk would produce only next_due, and what frees a body up there
+     * is the floor's own decay. */
+    if (warm_left >= g->page_pool.free_count_total) {
+        if (g->page_pool.free_count_total > 0) {
+            next_due = rb_hrtime_add(now, page_pool_floor_half_life);
+        }
+        ATOMIC_U64_SET_RELAXED(g->page_pool.next_due, next_due);
+        ATOMIC_U64_SET_RELAXED(g->page_pool.last_reclaim, now);
+        rb_native_mutex_unlock(&g->page_pool.lock);
+        return;
+    }
+
     for (struct page_arena *a = g->page_pool.arenas; a; a = a->next) {
         uint32_t advise_mask = 0;
 
+        /* Step B reads has_warm only once free_count is the whole arena, so an arena
+         * with nothing free needs neither the reset nor the walk. */
+        if (a->free_count == 0) continue;
         a->has_warm = false;
+
+        if (warm_left == 0) {
+            /* No warm bodies left to place, so this arena matters only if it has
+             * something advisable, and the tail bounds when that can happen. */
+            if (!can_advise || a->advised_count == a->free_count) continue;
+            rb_hrtime_t oldest_due = rb_hrtime_add(a->oldest_free_since,
+                                                   page_pool_advise_idle);
+            if (now < oldest_due) {
+                if (oldest_due < next_due) next_due = oldest_due;
+                continue;
+            }
+        }
+        /* Conversely, once the head is due every body here is. */
+        const bool all_due =
+            now >= rb_hrtime_add(a->newest_free_since, page_pool_advise_idle);
+
         for (int i = a->cold_freelist; i != PAGE_POOL_BODY_NIL; i = a->bodies[i].next) {
             struct page_pool_body_info *info = &a->bodies[i];
 
@@ -3231,64 +3274,68 @@ page_pool_reclaim(rb_global_objspace_t *g, size_t budget)
                 warm_left--;
                 a->has_warm = true;
                 any_warm = true;
+                continue;
             }
-            else if (can_advise && !info->advised) {
+            if (!can_advise || info->advised) continue;
+
+            if (!all_due) {
                 rb_hrtime_t due = rb_hrtime_add(info->free_since, page_pool_advise_idle);
                 if (now < due) {
                     if (due < next_due) next_due = due;
+                    continue;
                 }
-                else if (budget == 0) {
-                    deferred = true;
-                }
-                else {
-                    budget--;
-                    advise_mask |= (uint32_t)1 << i;
-                }
+            }
+            if (budget == 0) {
+                deferred = true;
+            }
+            else {
+                budget--;
+                advise_mask |= (uint32_t)1 << i;
             }
         }
 
-        for (int i = 0; i < PAGE_POOL_ARENA_BODIES; i++) {
-            if (!(advise_mask & ((uint32_t)1 << i))) continue;
+        /* Widened to 64 bits so the run arithmetic below has no 32-bit edge case: the
+         * high half is always zero, so ~mask always has a set bit to stop at. */
+        uint64_t left = advise_mask;
+        int base = 0;
+        while (left) {
+            int skip = ntz_int64(left);
+            left >>= skip;
+            base += skip;
+            int run_len = ntz_int64(~left);
 
-            int run = i;
-            while (i + 1 < PAGE_POOL_ARENA_BODIES &&
-                   (advise_mask & ((uint32_t)1 << (i + 1)))) {
-                i++;
-            }
-            int run_len = i - run + 1;
-
-            rb_vm_map_reusable_lazy(page_pool_body_at(a, run),
+            rb_vm_map_reusable_lazy(page_pool_body_at(a, base),
                                     (size_t)run_len * HEAP_PAGE_SIZE, 0);
-            for (int j = run; j <= i; j++) {
+            for (int j = base; j < base + run_len; j++) {
                 a->bodies[j].advised = true;
             }
             a->advised_count += run_len;
             g->page_pool.advised_count += run_len;
             g->page_pool.advised_pages += run_len;
             g->page_pool.advise_calls++;
+
+            left >>= run_len;
+            base += run_len;
         }
     }
 
     /* Step B — munmap fully-free arenas (with retention buffer).
      *
-     * total_free = Σ free_count (every free body is on its arena's cold freelist,
-     * since page_pool_release pushes there unconditionally).  An arena is eligible
-     * when all 32 of its bodies are free, none is inside the warm floor, and the last
-     * of them was released page_pool_unmap_idle ago.  Keep one extra empty arena
-     * when the rest of the free pool is < half an arena, to avoid thrash. */
-    int total_free = 0;
+     * total_free is free_count_total, which acquire and release maintain under this
+     * lock (every free body is on its arena's cold freelist, since page_pool_release
+     * pushes there unconditionally).  An arena is eligible when all 32 of its bodies
+     * are free, none is inside the warm floor, and the last of them was released
+     * page_pool_unmap_idle ago.  Keep one extra empty arena when the rest of the free
+     * pool is < half an arena, to avoid thrash. */
+    int total_free = (int)g->page_pool.free_count_total;
 #if RGENGC_CHECK_MODE
-    int total_advised = 0;
-#endif
+    int check_free = 0, check_advised = 0;
     for (struct page_arena *a = g->page_pool.arenas; a; a = a->next) {
-        total_free += a->free_count;
-#if RGENGC_CHECK_MODE
-        total_advised += a->advised_count;
-#endif
+        check_free += a->free_count;
+        check_advised += a->advised_count;
     }
-#if RGENGC_CHECK_MODE
-    GC_ASSERT((size_t)total_free == g->page_pool.free_count_total);
-    GC_ASSERT(total_advised == g->page_pool.advised_count);
+    GC_ASSERT(check_free == total_free);
+    GC_ASSERT(check_advised == g->page_pool.advised_count);
 #endif
 
     bool retained_one = false;

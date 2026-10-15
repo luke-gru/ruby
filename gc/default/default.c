@@ -2752,44 +2752,53 @@ page_pool_body_at(const struct page_arena *arena, int i)
  * arena once all its bodies have been free this long.  Both are overridable at runtime
  * (RUBY_GC_PAGE_POOL_*_IDLE_MSEC) so tests can drive Step A and Step B without waiting
  * out the defaults. */
-#ifndef PAGE_POOL_ADVISE_IDLE_NS
-# define PAGE_POOL_ADVISE_IDLE_NS (1 * RB_HRTIME_PER_SEC)
+#define PAGE_POOL_MSEC2HRTIME(msec) ((rb_hrtime_t)(msec) * RB_HRTIME_PER_MSEC)
+
+#ifndef PAGE_POOL_ADVISE_IDLE_MSEC
+# define PAGE_POOL_ADVISE_IDLE_MSEC 1000
 #endif
-#ifndef PAGE_POOL_UNMAP_IDLE_NS
-# define PAGE_POOL_UNMAP_IDLE_NS (5 * RB_HRTIME_PER_SEC)
+#ifndef PAGE_POOL_UNMAP_IDLE_MSEC
+# define PAGE_POOL_UNMAP_IDLE_MSEC 5000
 #endif
-STATIC_ASSERT(page_pool_unmap_after_advise, PAGE_POOL_UNMAP_IDLE_NS >= PAGE_POOL_ADVISE_IDLE_NS);
-static rb_hrtime_t page_pool_advise_idle = PAGE_POOL_ADVISE_IDLE_NS;
-static rb_hrtime_t page_pool_unmap_idle = PAGE_POOL_UNMAP_IDLE_NS;
+STATIC_ASSERT(page_pool_unmap_after_advise,
+              PAGE_POOL_UNMAP_IDLE_MSEC >= PAGE_POOL_ADVISE_IDLE_MSEC);
+static rb_hrtime_t page_pool_advise_idle = PAGE_POOL_MSEC2HRTIME(PAGE_POOL_ADVISE_IDLE_MSEC);
+static rb_hrtime_t page_pool_unmap_idle = PAGE_POOL_MSEC2HRTIME(PAGE_POOL_UNMAP_IDLE_MSEC);
 
 /* The warm floor halves every page_pool_floor_half_life without demand.  The acquire rate
  * it is sized from is sampled in page_pool_acquire, so these bound a window of allocation
- * traffic.  Below PAGE_POOL_RATE_MIN_WINDOW_NS the window keeps accumulating, so a tight
+ * traffic.  Below PAGE_POOL_RATE_MIN_WINDOW the window keeps accumulating, so a tight
  * allocation loop cannot roll it every few microseconds and read as an enormous rate.  A
- * window longer than PAGE_POOL_RATE_MAX_WINDOW_NS is measured as that long: a burst
- * confined to the tail of a long quiet window would otherwise be averaged away to nothing.
+ * window longer than PAGE_POOL_RATE_MAX_WINDOW is measured as that long: a burst confined
+ * to the tail of a long quiet window would otherwise be averaged away to nothing.
  * Clamping over-estimates demand instead, which errs toward keeping bodies resident. */
-#ifndef PAGE_POOL_RATE_MIN_WINDOW_NS
-# define PAGE_POOL_RATE_MIN_WINDOW_NS (RB_HRTIME_PER_SEC / 10)
+#ifndef PAGE_POOL_RATE_MIN_WINDOW_MSEC
+# define PAGE_POOL_RATE_MIN_WINDOW_MSEC 100
 #endif
-#ifndef PAGE_POOL_RATE_MAX_WINDOW_NS
-# define PAGE_POOL_RATE_MAX_WINDOW_NS (4 * RB_HRTIME_PER_SEC)
+#ifndef PAGE_POOL_RATE_MAX_WINDOW_MSEC
+# define PAGE_POOL_RATE_MAX_WINDOW_MSEC 4000
 #endif
+#define PAGE_POOL_RATE_MIN_WINDOW PAGE_POOL_MSEC2HRTIME(PAGE_POOL_RATE_MIN_WINDOW_MSEC)
+#define PAGE_POOL_RATE_MAX_WINDOW PAGE_POOL_MSEC2HRTIME(PAGE_POOL_RATE_MAX_WINDOW_MSEC)
+
 /* Half the advise wait: the floor has to forget demand faster than a body becomes
  * reclaimable, or it, rather than page_pool_advise_idle, is what decides when memory
  * comes back. */
-#ifndef PAGE_POOL_FLOOR_HALF_LIFE_NS
-# define PAGE_POOL_FLOOR_HALF_LIFE_NS (RB_HRTIME_PER_SEC / 2)
+#ifndef PAGE_POOL_FLOOR_HALF_LIFE_MSEC
+# define PAGE_POOL_FLOOR_HALF_LIFE_MSEC 500
 #endif
 STATIC_ASSERT(page_pool_rate_window_ordered,
-              PAGE_POOL_RATE_MAX_WINDOW_NS > PAGE_POOL_RATE_MIN_WINDOW_NS);
-static rb_hrtime_t page_pool_floor_half_life = PAGE_POOL_FLOOR_HALF_LIFE_NS;
+              PAGE_POOL_RATE_MAX_WINDOW_MSEC > PAGE_POOL_RATE_MIN_WINDOW_MSEC);
+static rb_hrtime_t page_pool_floor_half_life =
+    PAGE_POOL_MSEC2HRTIME(PAGE_POOL_FLOOR_HALF_LIFE_MSEC);
 
 /* A minor GC runs page_pool_reclaim only when something may have become reclaimable and
  * no reclaim has run for this long. */
-#ifndef PAGE_POOL_MINOR_RECLAIM_INTERVAL_NS
-# define PAGE_POOL_MINOR_RECLAIM_INTERVAL_NS (1 * RB_HRTIME_PER_SEC)
+#ifndef PAGE_POOL_MINOR_RECLAIM_INTERVAL_MSEC
+# define PAGE_POOL_MINOR_RECLAIM_INTERVAL_MSEC 1000
 #endif
+#define PAGE_POOL_MINOR_RECLAIM_INTERVAL \
+    PAGE_POOL_MSEC2HRTIME(PAGE_POOL_MINOR_RECLAIM_INTERVAL_MSEC)
 
 /* Cap on the madvise + munmap calls one page_pool_reclaim may issue.  A minor GC takes
  * PAGE_POOL_MINOR_RECLAIM_BUDGET so a large pool cannot turn a minor pause into a burst
@@ -2797,7 +2806,7 @@ static rb_hrtime_t page_pool_floor_half_life = PAGE_POOL_FLOOR_HALF_LIFE_NS;
  * that runs out leaves next_due at now, so the work resumes at the next opportunity. */
 #define PAGE_POOL_RECLAIM_UNLIMITED SIZE_MAX
 #ifndef PAGE_POOL_MINOR_RECLAIM_BUDGET
-# define PAGE_POOL_MINOR_RECLAIM_BUDGET 64
+# define PAGE_POOL_MINOR_RECLAIM_BUDGET 32
 #endif
 
 /* mmap has no portable way to ask for an aligned mapping, so the dependable method is
@@ -2991,8 +3000,8 @@ page_pool_sample_demand(rb_global_objspace_t *g, rb_hrtime_t now)
     ASSERT_PAGE_POOL_LOCKED(g);
 
     rb_hrtime_t dt = rb_hrtime_sub(now, g->page_pool.rate_window_start);
-    if (dt < PAGE_POOL_RATE_MIN_WINDOW_NS) return;
-    if (dt > PAGE_POOL_RATE_MAX_WINDOW_NS) dt = PAGE_POOL_RATE_MAX_WINDOW_NS;
+    if (dt < PAGE_POOL_RATE_MIN_WINDOW) return;
+    if (dt > PAGE_POOL_RATE_MAX_WINDOW) dt = PAGE_POOL_RATE_MAX_WINDOW;
 
     size_t acquired = g->page_pool.acquired_in_window;
     uint64_t scaled = (uint64_t)acquired > UINT64_MAX / page_pool_advise_idle
@@ -3141,7 +3150,7 @@ page_pool_release(struct heap_page_body *body, struct page_arena *arena)
 
 /* Whether a minor GC should run page_pool_reclaim: something may have become
  * reclaimable (see next_due) and no reclaim has run for
- * PAGE_POOL_MINOR_RECLAIM_INTERVAL_NS.  Read without the pool lock, so a backwards
+ * PAGE_POOL_MINOR_RECLAIM_INTERVAL.  Read without the pool lock, so a backwards
  * clock step just defers the next pass. */
 static bool
 page_pool_reclaim_due(rb_global_objspace_t *g)
@@ -3151,7 +3160,7 @@ page_pool_reclaim_due(rb_global_objspace_t *g)
     rb_hrtime_t now = rb_hrtime_now();
     rb_hrtime_t since = rb_hrtime_sub(now, ATOMIC_U64_LOAD_RELAXED(g->page_pool.last_reclaim));
     return now >= ATOMIC_U64_LOAD_RELAXED(g->page_pool.next_due) &&
-        since >= PAGE_POOL_MINOR_RECLAIM_INTERVAL_NS;
+        since >= PAGE_POOL_MINOR_RECLAIM_INTERVAL;
 #else
     return false;
 #endif
@@ -3361,7 +3370,7 @@ static bool page_pool_thread_enabled = PAGE_POOL_THREAD_DEFAULT;
 # define PAGE_POOL_THREAD_WAKE_SLACK_MSEC 100
 #endif
 #define PAGE_POOL_THREAD_WAKE_SLACK \
-    ((rb_hrtime_t)PAGE_POOL_THREAD_WAKE_SLACK_MSEC * RB_HRTIME_PER_MSEC)
+    PAGE_POOL_MSEC2HRTIME(PAGE_POOL_THREAD_WAKE_SLACK_MSEC)
 
 /* Wait until next_due.  Returns false once the thread should exit.  A release only moves
  * next_due earlier, so re-reading it on every wakeup is the whole schedule: a signal means

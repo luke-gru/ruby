@@ -351,11 +351,13 @@ class TestGc < Test::Unit::TestCase
       # Free bodies in the pool can never exceed the total pages ever retained.
       assert_operator stat[:page_pool_free_pages], :<=, stat[:page_pool_total_pages]
       assert_operator stat[:page_pool_arenas], :>=, 0 # arenas is always 0 if doesn't have mmap
-      # advises/reuses are cumulative, discarded_pages is a gauge of what is advised right
-      # now: every advised body was advised once and not yet reused or unmapped, and every
-      # reuse consumed an advised body.
-      assert_operator stat[:page_pool_discarded_pages], :<=, stat[:page_pool_advises]
-      assert_operator stat[:page_pool_reuses], :<=, stat[:page_pool_advises]
+      # advised_pages/reuses are cumulative, discarded_pages is a gauge of what is advised
+      # right now: every advised body was advised once and not yet reused or unmapped, and
+      # every reuse consumed an advised body.
+      assert_operator stat[:page_pool_discarded_pages], :<=, stat[:page_pool_advised_pages]
+      assert_operator stat[:page_pool_reuses], :<=, stat[:page_pool_advised_pages]
+      # Physically adjacent bodies share one madvise call, so calls never exceed bodies.
+      assert_operator stat[:page_pool_advises], :<=, stat[:page_pool_advised_pages]
       # The range assertions above say nothing about arena freeing unless Step B ran.
       omit 'heap never freed a whole arena' if freed == 0
     RUBY

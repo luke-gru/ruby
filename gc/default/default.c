@@ -2740,51 +2740,115 @@ static rb_hrtime_t page_pool_floor_half_life = PAGE_POOL_FLOOR_HALF_LIFE_NS;
 # define PAGE_POOL_MINOR_RECLAIM_BUDGET 64
 #endif
 
+/* mmap has no portable way to ask for an aligned mapping, so the dependable method is
+ * to over-map by the alignment and trim the excess -- one mmap plus one or two munmaps,
+ * every time.  With OPTIMISTIC_ARENA_ALIGN, page_pool_map_arena first asks for exactly
+ * one arena, and keeps that mapping when it comes back aligned, falling back to the
+ * trim otherwise (the same approach as jemalloc's pages_map).  Set to 0 to always
+ * trim. */
+#ifndef OPTIMISTIC_ARENA_ALIGN
+# define OPTIMISTIC_ARENA_ALIGN 1
+#endif
+
 #ifdef HAVE_MMAP
-/* mmap a new arena to carve from.  Called with the pool lock held, at which point the
- * previous arena is always fully carved. */
-static bool
-page_pool_add_arena(rb_global_objspace_t *g)
+static void
+page_pool_name_arena(char *ptr, size_t size)
 {
-    GC_ASSERT(HEAP_PAGE_ALIGN % sysconf(_SC_PAGE_SIZE) == 0);
-
-    size_t mmap_size = PAGE_POOL_ARENA_SIZE + HEAP_PAGE_ALIGN;
-    char *ptr = mmap(NULL, mmap_size,
-                     PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (ptr == MAP_FAILED) {
-        return false;
-    }
-
     // If we are building `default.c` as part of the ruby executable, we
     // may just call `ruby_annotate_mmap`.  But if we are building
     // `default.c` as a shared library, we will not have access to private
     // symbols, and we have to either call prctl directly or make our own
     // wrapper.
 #if defined(HAVE_SYS_PRCTL_H) && defined(PR_SET_VMA) && defined(PR_SET_VMA_ANON_NAME)
-    prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ptr, mmap_size, "Ruby:GC:default:page_pool_arena");
+    prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ptr, size, "Ruby:GC:default:page_pool_arena");
     errno = 0;
+#else
+    (void)ptr;
+    (void)size;
+#endif
+}
+
+/* Map PAGE_POOL_ARENA_SIZE of HEAP_PAGE_ALIGN aligned address space, or NULL.
+ *
+ * The optimistic path hints at the end of the newest arena, which both raises the hit
+ * rate and tends to place arenas contiguously.  It nearly always lands aligned: the
+ * kernel continues where the last arena ended, and the arena size is a whole multiple
+ * of HEAP_PAGE_ALIGN, so an aligned run stays aligned -- and a miss falls back to the
+ * trim, which leaves the next hint aligned again.  The hint is advisory (no MAP_FIXED,
+ * which would unmap whatever already lives there), so the result still has to be
+ * checked for alignment. */
+static char *
+page_pool_map_arena(rb_global_objspace_t *g)
+{
+    const int prot = PROT_READ | PROT_WRITE;
+    const int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+
+    GC_ASSERT(HEAP_PAGE_ALIGN % sysconf(_SC_PAGE_SIZE) == 0);
+
+#if OPTIMISTIC_ARENA_ALIGN
+    /* arenas is newest first, so its head ends where the next one wants to start. */
+    char *hint = g->page_pool.arenas == NULL ? NULL :
+        g->page_pool.arenas->start + g->page_pool.arenas->size;
+    char *exact = mmap(hint, PAGE_POOL_ARENA_SIZE, prot, flags, -1, 0);
+    if (exact != MAP_FAILED) {
+        if (((uintptr_t)exact & (HEAP_PAGE_ALIGN - 1)) == 0) {
+            page_pool_name_arena(exact, PAGE_POOL_ARENA_SIZE);
+            return exact;
+        }
+        if (munmap(exact, PAGE_POOL_ARENA_SIZE)) {
+            rb_bug("page_pool_map_arena: munmap failed for unaligned mapping");
+        }
+    }
 #endif
 
-    /* Trim the unaligned head and tail so the usable area is HEAP_PAGE_ALIGN aligned. */
-    char *aligned = ptr + HEAP_PAGE_ALIGN;
-    aligned -= ((uintptr_t)aligned & (HEAP_PAGE_ALIGN - 1));
-    GC_ASSERT(aligned > ptr);
-    GC_ASSERT(aligned <= ptr + HEAP_PAGE_ALIGN);
+    /* Over-map and trim.  The slack is one alignment less one OS page, not a whole
+     * alignment: mmap already returns an OS page aligned address, so that is the most
+     * the head can ever be out by, and the rest would be address space the trim hands
+     * straight back. */
+    size_t os_page_size = g->page_pool.os_page_size;
+    size_t slack = os_page_size > 0 && os_page_size <= HEAP_PAGE_ALIGN
+        ? HEAP_PAGE_ALIGN - os_page_size : HEAP_PAGE_ALIGN;
+    size_t mmap_size = PAGE_POOL_ARENA_SIZE + slack;
+
+    char *ptr = mmap(NULL, mmap_size, prot, flags, -1, 0);
+    if (ptr == MAP_FAILED) {
+        return NULL;
+    }
+    page_pool_name_arena(ptr, mmap_size);
+
+    char *aligned = ptr + ((HEAP_PAGE_ALIGN - ((uintptr_t)ptr & (HEAP_PAGE_ALIGN - 1)))
+                           & (HEAP_PAGE_ALIGN - 1));
+    GC_ASSERT(aligned >= ptr);
+    GC_ASSERT(aligned + PAGE_POOL_ARENA_SIZE <= ptr + mmap_size);
 
     size_t start_out_of_range_size = aligned - ptr;
     GC_ASSERT(start_out_of_range_size % sysconf(_SC_PAGE_SIZE) == 0);
+    GC_ASSERT(start_out_of_range_size <= slack);
     if (start_out_of_range_size > 0) {
         if (munmap(ptr, start_out_of_range_size)) {
-            rb_bug("page_pool_add_arena: munmap failed for start");
+            rb_bug("page_pool_map_arena: munmap failed for start");
         }
     }
 
-    size_t end_out_of_range_size = HEAP_PAGE_ALIGN - start_out_of_range_size;
+    size_t end_out_of_range_size = slack - start_out_of_range_size;
     GC_ASSERT(end_out_of_range_size % sysconf(_SC_PAGE_SIZE) == 0);
     if (end_out_of_range_size > 0) {
         if (munmap(aligned + PAGE_POOL_ARENA_SIZE, end_out_of_range_size)) {
-            rb_bug("page_pool_add_arena: munmap failed for end");
+            rb_bug("page_pool_map_arena: munmap failed for end");
         }
+    }
+
+    return aligned;
+}
+
+/* mmap a new arena to carve from.  Called with the pool lock held, at which point the
+ * previous arena is always fully carved. */
+static bool
+page_pool_add_arena(rb_global_objspace_t *g)
+{
+    char *aligned = page_pool_map_arena(g);
+    if (aligned == NULL) {
+        return false;
     }
 
     struct page_arena *arena = calloc1(sizeof(struct page_arena));

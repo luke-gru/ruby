@@ -852,6 +852,25 @@ typedef struct rb_objspace {
     } process_stat;
 } rb_objspace_t;
 
+/* The page pool can do its madvise and munmap on a dedicated native thread (see
+ * page_pool_thread_func) rather than inside a GC.  Needs mmap and pthreads. */
+#if defined(HAVE_MMAP) && defined(HAVE_PTHREAD_H) && !defined(_WIN32) && !defined(__wasi__)
+# define USE_PAGE_POOL_THREAD 1
+#else
+# define USE_PAGE_POOL_THREAD 0
+#endif
+
+#if USE_PAGE_POOL_THREAD
+/* FAILED is terminal: a reclaimer that will not start is not fatal, the work just stays
+ * on the GC threads. */
+enum page_pool_thread_state {
+    PAGE_POOL_THREAD_STOPPED,
+    PAGE_POOL_THREAD_RUNNING,
+    PAGE_POOL_THREAD_STOPPING,
+    PAGE_POOL_THREAD_FAILED,
+};
+#endif
+
 /* The one VM-global GC structure; for now it only holds the page pool.  Page bodies are
  * carved out of large mmap arenas and reused via a process-wide freelist (per-page
  * mmap/munmap would serialize on the kernel's mmap_lock).  Leaf lock: no alloc, no GC. */
@@ -887,6 +906,23 @@ typedef struct rb_global_objspace {
         /* Read without the lock by page_pool_reclaim_due, so accessed atomically. */
         rbimpl_atomic_uint64_t last_reclaim; /* when page_pool_reclaim last ran */
         rbimpl_atomic_uint64_t next_due;     /* earliest time anything may become reclaimable */
+#if USE_PAGE_POOL_THREAD
+        /* The reclamation thread, and the state a releasing thread uses to wake it.
+         * Guarded by wake_lock rather than by lock, so a release can wake the reclaimer
+         * without waiting behind a whole reclaim pass.  wake_lock is a leaf: never take
+         * lock while holding it. */
+        rb_nativethread_lock_t wake_lock;
+        rb_nativethread_cond_t wake_cond;
+        rb_nativethread_id_t thread_id;
+        enum page_pool_thread_state thread_state;
+        /* The deadline the reclaimer is guaranteed to wake at, published for notifiers to
+         * read without wake_lock: 0 while it is awake, RB_HRTIME_MAX when it will not wake
+         * on its own (indefinite sleep, or no thread). */
+        rbimpl_atomic_uint64_t thread_armed_until;
+        /* Set when before_fork joined a running reclaimer, so after_fork knows to bring
+         * it back in both processes. */
+        bool thread_stopped_for_fork;
+#endif
     } page_pool;
 
     /* Zombie pages left after the last global cycle (roughly the live data).  Updated
@@ -980,6 +1016,9 @@ static void page_pool_release_locked(struct heap_page_body *body, struct page_ar
                                      rb_hrtime_t now);
 #endif
 static void page_pool_reclaim(rb_global_objspace_t *g, size_t budget);
+#if USE_PAGE_POOL_THREAD
+static void page_pool_thread_notify(rb_global_objspace_t *g);
+#endif
 
 #if RGENGC_CHECK_MODE && !defined(_WIN32) && !defined(__wasi__) && defined(HAVE_PTHREAD_H)
 # define PAGE_POOL_LOCK_ERRORCHECK 1
@@ -1028,6 +1067,13 @@ global_objspace_init(void)
         g->page_pool.warm_peak_time = g->page_pool.rate_window_start;
         ATOMIC_U64_SET_RELAXED(g->page_pool.last_reclaim, g->page_pool.rate_window_start);
         ATOMIC_U64_SET_RELAXED(g->page_pool.next_due, RB_HRTIME_MAX);
+#if USE_PAGE_POOL_THREAD
+        page_pool_lock_initialize(&g->page_pool.wake_lock);
+        rb_native_cond_initialize(&g->page_pool.wake_cond);
+        g->page_pool.thread_state = PAGE_POOL_THREAD_STOPPED;
+        ATOMIC_U64_SET_RELAXED(g->page_pool.thread_armed_until, RB_HRTIME_MAX);
+        g->page_pool.thread_stopped_for_fork = false;
+#endif
 #ifdef HAVE_MMAP
         g->page_pool.os_page_size = sysconf(_SC_PAGE_SIZE);
 #else
@@ -2524,15 +2570,24 @@ heap_pages_free_batch(rb_objspace_t *objspace, struct heap_page *pages)
     /* One stamp for the whole batch; only read the clock if the pool is actually in use. */
     rb_hrtime_t now = HEAP_PAGE_ALLOC_USE_MMAP ? page_pool_now(g) : 0;
 #endif
+    bool released_to_pool = false;
     for (struct heap_page *page = pages; page != NULL; page = page->free_next) {
         global_page_index_remove_locked(page);
         if (HEAP_PAGE_ALLOC_USE_MMAP) {
 #ifdef HAVE_MMAP
             page_pool_release_locked(page->body, page->arena, now);
+            released_to_pool = true;
 #endif
         }
     }
     rb_native_mutex_unlock(&g->page_pool.lock);
+
+#if USE_PAGE_POOL_THREAD
+    /* One wakeup for the batch, not one per page. */
+    if (released_to_pool) page_pool_thread_notify(g);
+#else
+    (void)released_to_pool;
+#endif
 
     if (!HEAP_PAGE_ALLOC_USE_MMAP) {
         /* gc_aligned_free does not need the pool lock. */
@@ -3071,6 +3126,9 @@ page_pool_release(struct heap_page_body *body, struct page_arena *arena)
         rb_native_mutex_lock(&g->page_pool.lock);
         page_pool_release_locked(body, arena, page_pool_now(g));
         rb_native_mutex_unlock(&g->page_pool.lock);
+# if USE_PAGE_POOL_THREAD
+        page_pool_thread_notify(g);
+# endif
 #endif
     }
     else {
@@ -3284,6 +3342,222 @@ page_pool_reclaim(rb_global_objspace_t *g, size_t budget)
     rb_native_mutex_unlock(&g->page_pool.lock);
 #endif
 }
+
+#if USE_PAGE_POOL_THREAD
+/* Whether reclamation runs on its own thread; RUBY_PAGE_POOL_THREAD=0 keeps it on the
+ * GC threads, which is also what a platform without the thread does. */
+#ifndef PAGE_POOL_THREAD_DEFAULT
+# define PAGE_POOL_THREAD_DEFAULT 1
+#endif
+static bool page_pool_thread_enabled = PAGE_POOL_THREAD_DEFAULT;
+
+/* How late the reclaimer may be woken rather than woken again: a release that moves
+ * next_due earlier by less than this is left to the wait already pending, which is what
+ * keeps a burst of releases to a single wakeup. */
+#ifndef PAGE_POOL_THREAD_WAKE_SLACK_MSEC
+# define PAGE_POOL_THREAD_WAKE_SLACK_MSEC 100
+#endif
+#define PAGE_POOL_THREAD_WAKE_SLACK \
+    ((rb_hrtime_t)PAGE_POOL_THREAD_WAKE_SLACK_MSEC * RB_HRTIME_PER_MSEC)
+
+/* Wait until next_due.  Returns false once the thread should exit.  A release only moves
+ * next_due earlier, so re-reading it on every wakeup is the whole schedule: a signal means
+ * "your deadline moved", not "run a pass now". */
+static bool
+page_pool_thread_wait(rb_global_objspace_t *g)
+{
+    rb_native_mutex_lock(&g->page_pool.wake_lock);
+
+    for (;;) {
+        if (g->page_pool.thread_state != PAGE_POOL_THREAD_RUNNING) {
+            ATOMIC_U64_SET_RELAXED(g->page_pool.thread_armed_until, RB_HRTIME_MAX);
+            rb_native_mutex_unlock(&g->page_pool.wake_lock);
+            return false;
+        }
+
+        /* next_due is written under page_pool.lock and read here under wake_lock, so a
+         * release that lands between this read and the wait below is not lost: the
+         * notify that follows it cannot signal until this thread is waiting. */
+        rb_hrtime_t due = ATOMIC_U64_LOAD_RELAXED(g->page_pool.next_due);
+        rb_hrtime_t now = rb_hrtime_now();
+
+        if (due != RB_HRTIME_MAX && now >= due) {
+            ATOMIC_U64_SET_RELAXED(g->page_pool.thread_armed_until, 0);
+            rb_native_mutex_unlock(&g->page_pool.wake_lock);
+            return true;
+        }
+
+        ATOMIC_U64_SET_RELAXED(g->page_pool.thread_armed_until, due);
+        if (due == RB_HRTIME_MAX) {
+            /* Nothing is cached, so nothing will become due on its own: sleep until a
+             * release says otherwise, leaving an idle process without a timer wakeup. */
+            rb_native_cond_wait(&g->page_pool.wake_cond, &g->page_pool.wake_lock);
+        }
+        else {
+            uint64_t msec = (due - now + RB_HRTIME_PER_MSEC - 1) / RB_HRTIME_PER_MSEC;
+            rb_native_cond_timedwait(&g->page_pool.wake_cond, &g->page_pool.wake_lock,
+                                     (unsigned long)(msec > 0 ? msec : 1));
+        }
+    }
+}
+
+static void *
+page_pool_thread_func(void *arg)
+{
+    rb_global_objspace_t *g = (rb_global_objspace_t *)arg;
+
+#ifdef HAVE_PTHREAD_SETNAME_NP
+# ifdef __APPLE__
+    pthread_setname_np("ruby:page_pool");
+# else
+    pthread_setname_np(pthread_self(), "ruby:page_pool");
+# endif
+#endif
+
+    while (page_pool_thread_wait(g)) {
+        /* Unbudgeted: the budget exists to keep a syscall burst out of a GC pause, and
+         * there is no pause here to protect. */
+        page_pool_reclaim(g, PAGE_POOL_RECLAIM_UNLIMITED);
+    }
+
+    return NULL;
+}
+
+/* Start the reclaimer.  Called with wake_lock held, from the first release that finds no
+ * thread: creating it lazily keeps it out of processes that never fill the pool. */
+static void
+page_pool_thread_start_locked(rb_global_objspace_t *g)
+{
+    GC_ASSERT(g->page_pool.thread_state == PAGE_POOL_THREAD_STOPPED);
+
+    /* The reclaimer has no Ruby thread to deliver a signal to, so mask everything across
+     * the create and let it inherit an empty set. */
+    sigset_t set, oldset;
+    sigfillset(&set);
+    if (pthread_sigmask(SIG_SETMASK, &set, &oldset) != 0) {
+        g->page_pool.thread_state = PAGE_POOL_THREAD_FAILED;
+        return;
+    }
+
+    g->page_pool.thread_state = PAGE_POOL_THREAD_RUNNING;
+    int err = pthread_create(&g->page_pool.thread_id, NULL, page_pool_thread_func, g);
+    if (err != 0) {
+        g->page_pool.thread_state = PAGE_POOL_THREAD_FAILED;
+    }
+
+    /* Leaving the calling thread with every signal blocked would change the program's
+     * behaviour, not just the pool's. */
+    if (pthread_sigmask(SIG_SETMASK, &oldset, NULL) != 0) {
+        rb_bug("page_pool_thread_start_locked: could not restore the signal mask");
+    }
+}
+
+/* Returns whether there was a thread to join. */
+static bool
+page_pool_thread_stop(rb_global_objspace_t *g)
+{
+    rb_native_mutex_lock(&g->page_pool.wake_lock);
+    if (g->page_pool.thread_state != PAGE_POOL_THREAD_RUNNING) {
+        rb_native_mutex_unlock(&g->page_pool.wake_lock);
+        return false;
+    }
+    g->page_pool.thread_state = PAGE_POOL_THREAD_STOPPING;
+    rb_native_cond_signal(&g->page_pool.wake_cond);
+    rb_native_mutex_unlock(&g->page_pool.wake_lock);
+
+    /* The thread only checks the state between passes, so this waits out a pass in
+     * progress and returns with the arena list consistent and lock released. */
+    if (pthread_join(g->page_pool.thread_id, NULL)) {
+        rb_bug("page_pool_thread_stop: pthread_join failed");
+    }
+    g->page_pool.thread_state = PAGE_POOL_THREAD_STOPPED;
+    ATOMIC_U64_SET_RELAXED(g->page_pool.thread_armed_until, RB_HRTIME_MAX);
+    return true;
+}
+
+/* Bodies have gone back to the pool.  Called with no page pool lock held. */
+static void
+page_pool_thread_notify(rb_global_objspace_t *g)
+{
+    if (!page_pool_thread_enabled) return;
+
+    /* The common case is a release whose deadline is no earlier than the one the
+     * reclaimer is already waiting on -- releases lower next_due to a minimum, so every
+     * release after the first in a burst lands here -- and that case costs two relaxed
+     * loads and no lock.  A thread that is awake reads as 0 and needs no signal either:
+     * it re-reads next_due when its pass ends. */
+    rb_hrtime_t due = ATOMIC_U64_LOAD_RELAXED(g->page_pool.next_due);
+    if (due != RB_HRTIME_MAX) due = rb_hrtime_add(due, PAGE_POOL_THREAD_WAKE_SLACK);
+    if (ATOMIC_U64_LOAD_RELAXED(g->page_pool.thread_armed_until) <= due) return;
+
+    rb_native_mutex_lock(&g->page_pool.wake_lock);
+    switch (g->page_pool.thread_state) {
+      case PAGE_POOL_THREAD_STOPPED:
+        page_pool_thread_start_locked(g);
+        break;
+      case PAGE_POOL_THREAD_RUNNING:
+        rb_native_cond_signal(&g->page_pool.wake_cond);
+        break;
+      case PAGE_POOL_THREAD_STOPPING:
+      case PAGE_POOL_THREAD_FAILED:
+        break;
+    }
+    rb_native_mutex_unlock(&g->page_pool.wake_lock);
+}
+
+/* No reclaimer may be running when the child is snapshotted: a pass in flight leaves an
+ * arena off the list but not yet unmapped, and rb_gc_vm_barrier does not stop it because
+ * it is not a Ruby thread.  The state is parked at STOPPING across the fork so a release
+ * in the meantime cannot start a replacement. */
+static void
+page_pool_thread_before_fork(rb_global_objspace_t *g)
+{
+    g->page_pool.thread_stopped_for_fork = page_pool_thread_stop(g);
+
+    rb_native_mutex_lock(&g->page_pool.wake_lock);
+    if (g->page_pool.thread_state == PAGE_POOL_THREAD_STOPPED) {
+        g->page_pool.thread_state = PAGE_POOL_THREAD_STOPPING;
+    }
+    rb_native_mutex_unlock(&g->page_pool.wake_lock);
+}
+
+/* The child's copies of wake_lock and wake_cond are re-initialized rather than destroyed:
+ * destroying one that was held at the fork moment reports EBUSY (see the timer thread). */
+static void
+page_pool_thread_after_fork(rb_global_objspace_t *g, bool child)
+{
+    if (child) {
+        page_pool_lock_initialize(&g->page_pool.wake_lock);
+        rb_native_cond_initialize(&g->page_pool.wake_cond);
+    }
+
+    rb_native_mutex_lock(&g->page_pool.wake_lock);
+    ATOMIC_U64_SET_RELAXED(g->page_pool.thread_armed_until, RB_HRTIME_MAX);
+    if (g->page_pool.thread_state == PAGE_POOL_THREAD_STOPPING) {
+        g->page_pool.thread_state = PAGE_POOL_THREAD_STOPPED;
+    }
+    if (g->page_pool.thread_stopped_for_fork) {
+        g->page_pool.thread_stopped_for_fork = false;
+        if (g->page_pool.thread_state == PAGE_POOL_THREAD_STOPPED) {
+            page_pool_thread_start_locked(g);
+        }
+    }
+    rb_native_mutex_unlock(&g->page_pool.wake_lock);
+}
+
+/* Teardown still frees pages, and each batch notifies, so this clears the flag the notify
+ * checks first instead of relying on the join alone. */
+static void
+page_pool_thread_shutdown(rb_global_objspace_t *g)
+{
+    page_pool_thread_enabled = false;
+    page_pool_thread_stop(g);
+}
+
+# define PAGE_POOL_THREAD_ON_P() page_pool_thread_enabled
+#else
+# define PAGE_POOL_THREAD_ON_P() false
+#endif
 
 static struct heap_page_body *
 heap_page_body_allocate(struct page_arena **arena_out)
@@ -6059,11 +6333,20 @@ gc_sweep_finish(rb_objspace_t *objspace)
          * otherwise put a burst of syscalls in a minor pause.  A global GC suppresses this
          * per-objspace reclaim; gc_start_global runs a single reclaim after its sweep
          * instead.  A postmortem GC suppresses it too; absorbing the dead Ractor's
-         * objspace runs one reclaim after its pages have been returned to the pool. */
+         * objspace runs one reclaim after its pages have been returned to the pool.
+         *
+         * With the reclamation thread on, heap_pages_free_unused_pages above has already
+         * notified it, so none of this runs in the pause -- except for an explicit
+         * GC.start, where returning memory now is the point of the call. */
         if (is_full_marking(objspace)) {
-            page_pool_reclaim(global_objspace, PAGE_POOL_RECLAIM_UNLIMITED);
+            /* GPR_FLAG_METHOD means the application called GC.start rather than the heap
+             * deciding on its own, so it asked for the memory back now. */
+            if (!PAGE_POOL_THREAD_ON_P() ||
+                (objspace->profile.latest_gc_info & GPR_FLAG_METHOD)) {
+                page_pool_reclaim(global_objspace, PAGE_POOL_RECLAIM_UNLIMITED);
+            }
         }
-        else if (page_pool_reclaim_due(global_objspace)) {
+        else if (!PAGE_POOL_THREAD_ON_P() && page_pool_reclaim_due(global_objspace)) {
             page_pool_reclaim(global_objspace, PAGE_POOL_MINOR_RECLAIM_BUDGET);
         }
     }
@@ -10287,7 +10570,11 @@ gc_start_global(rb_objspace_t *driver, unsigned int reason, bool compact, bool a
         os->heap_pages.freeable_pages = objspace_post_sweep_freeable_pages(os);
         heap_pages_free_unused_pages(os);
     }
-    page_pool_reclaim(global_objspace, PAGE_POOL_RECLAIM_UNLIMITED);
+    /* The releases just above notified the reclamation thread; only do the work in the
+     * stopped world when there is no thread to do it. */
+    if (!PAGE_POOL_THREAD_ON_P()) {
+        page_pool_reclaim(global_objspace, PAGE_POOL_RECLAIM_UNLIMITED);
+    }
 
     /* A global GC never calls gc_marks_finish, which budgets heap growth
      * (allocatable_bytes).  An objspace still full after the global sweep (materializing
@@ -10651,8 +10938,11 @@ objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
     /* A dead Ractor's teardown just piled bodies into the pool; let reclaim advise or
      * unmap whatever has been idle long enough now, rather than waiting for the next
      * major GC.  Absorb holds the VM lock but no barrier; page_pool_reclaim is
-     * self-locking. */
-    page_pool_reclaim(global_objspace, PAGE_POOL_RECLAIM_UNLIMITED);
+     * self-locking.  The reclamation thread was notified by those releases and takes this
+     * over when it is on. */
+    if (!PAGE_POOL_THREAD_ON_P()) {
+        page_pool_reclaim(global_objspace, PAGE_POOL_RECLAIM_UNLIMITED);
+    }
 
     global_objspace->during_absorb = prev_absorb;
 }
@@ -12033,6 +12323,22 @@ rb_gc_impl_set_params(void *objspace_ptr)
     if (page_pool_unmap_idle < page_pool_advise_idle) {
         page_pool_unmap_idle = page_pool_advise_idle;
     }
+
+#if USE_PAGE_POOL_THREAD
+    /* get_envparam_size rejects 0, which is the value that has to turn the thread off,
+     * so this one is parsed here. */
+    const char *ptr = getenv("RUBY_PAGE_POOL_THREAD");
+    if (ptr != NULL && *ptr != '\0') {
+        char *end;
+        long val = strtol(ptr, &end, 10);
+        if (*end == '\0') {
+            page_pool_thread_enabled = (val != 0);
+        }
+        else if (RTEST(ruby_verbose)) {
+            fprintf(stderr, "invalid value for RUBY_PAGE_POOL_THREAD: %s\n", ptr);
+        }
+    }
+#endif
 }
 
 static inline size_t
@@ -13657,6 +13963,10 @@ rb_gc_impl_objspace_free(void *objspace_ptr)
     if (is_lazy_sweeping(objspace))
         rb_bug("lazy sweeping underway when freeing object space");
 
+#if USE_PAGE_POOL_THREAD
+    page_pool_thread_shutdown(global_objspace);
+#endif
+
     free(objspace->profile.records);
     objspace->profile.records = NULL;
 
@@ -13728,6 +14038,10 @@ rb_gc_impl_before_fork(void *objspace_ptr)
 
     objspace->fork_vm_lock_lev = RB_GC_VM_LOCK();
     rb_gc_vm_barrier();
+
+#if USE_PAGE_POOL_THREAD
+    page_pool_thread_before_fork(global_objspace);
+#endif
 }
 
 void
@@ -13748,6 +14062,10 @@ rb_gc_impl_after_fork(void *objspace_ptr, rb_pid_t pid)
         global_objspace->main_objspace = objspace;
         page_pool_lock_initialize(&rb_global_objspace_instance.page_pool.lock);
     }
+
+#if USE_PAGE_POOL_THREAD
+    page_pool_thread_after_fork(global_objspace, pid == 0);
+#endif
 }
 
 VALUE rb_ident_hash_new_capa(long size);

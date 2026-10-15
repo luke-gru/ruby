@@ -2775,8 +2775,11 @@ static rb_hrtime_t page_pool_unmap_idle = PAGE_POOL_UNMAP_IDLE_NS;
 #ifndef PAGE_POOL_RATE_MAX_WINDOW_NS
 # define PAGE_POOL_RATE_MAX_WINDOW_NS (4 * RB_HRTIME_PER_SEC)
 #endif
+/* Half the advise wait: the floor has to forget demand faster than a body becomes
+ * reclaimable, or it, rather than page_pool_advise_idle, is what decides when memory
+ * comes back. */
 #ifndef PAGE_POOL_FLOOR_HALF_LIFE_NS
-# define PAGE_POOL_FLOOR_HALF_LIFE_NS (2 * RB_HRTIME_PER_SEC)
+# define PAGE_POOL_FLOOR_HALF_LIFE_NS (RB_HRTIME_PER_SEC / 2)
 #endif
 STATIC_ASSERT(page_pool_rate_window_ordered,
               PAGE_POOL_RATE_MAX_WINDOW_NS > PAGE_POOL_RATE_MIN_WINDOW_NS);

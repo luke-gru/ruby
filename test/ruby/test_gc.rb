@@ -386,8 +386,8 @@ class TestGc < Test::Unit::TestCase
       end
       assert_operator busy, :>, 0, "acquiring from the pool should build a warm floor"
 
-      # The floor is only recomputed by a reclaim, and the GC that triggers one can itself
-      # take a few bodies from the pool -- fresh demand that holds the floor just above
+      # The GC that ends each round can itself take a few bodies from the pool, and an
+      # acquire is what samples the rate -- fresh demand that holds the floor just above
       # zero for a cycle.  So idle repeatedly until it bottoms out.
       idle = nil
       5.times do

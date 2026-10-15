@@ -876,7 +876,8 @@ typedef struct rb_global_objspace {
                                            * MADV_FREE_REUSE each on Darwin (for GC.stat) */
         size_t acquired_in_window;        /* bodies handed out since rate_window_start */
         rb_hrtime_t rate_window_start;    /* start of the current acquire-rate window */
-        size_t warm_floor;                /* free bodies page_pool_reclaim keeps warm */
+        size_t warm_floor;                /* free bodies page_pool_reclaim keeps warm;
+                                           * last value page_pool_warm_floor computed */
         size_t warm_peak;                 /* warm_floor decays from this value ... */
         rb_hrtime_t warm_peak_time;       /* ... set at this time */
         /* rb_hrtime_now() is not guaranteed monotonic (thread.c falls back to the wall
@@ -2706,12 +2707,13 @@ STATIC_ASSERT(page_pool_unmap_after_advise, PAGE_POOL_UNMAP_IDLE_NS >= PAGE_POOL
 static rb_hrtime_t page_pool_advise_idle = PAGE_POOL_ADVISE_IDLE_NS;
 static rb_hrtime_t page_pool_unmap_idle = PAGE_POOL_UNMAP_IDLE_NS;
 
-/* The warm floor halves every page_pool_floor_half_life without demand.  An
- * acquire-rate sample needs a window of at least PAGE_POOL_RATE_MIN_WINDOW_NS, and a
- * window longer than PAGE_POOL_RATE_MAX_WINDOW_NS is treated as that long: a burst
- * confined to the tail of a long quiet window would otherwise be averaged away to
- * nothing.  Clamping over-estimates demand instead, which errs toward keeping bodies
- * resident. */
+/* The warm floor halves every page_pool_floor_half_life without demand.  The acquire rate
+ * it is sized from is sampled in page_pool_acquire, so these bound a window of allocation
+ * traffic.  Below PAGE_POOL_RATE_MIN_WINDOW_NS the window keeps accumulating, so a tight
+ * allocation loop cannot roll it every few microseconds and read as an enormous rate.  A
+ * window longer than PAGE_POOL_RATE_MAX_WINDOW_NS is measured as that long: a burst
+ * confined to the tail of a long quiet window would otherwise be averaged away to nothing.
+ * Clamping over-estimates demand instead, which errs toward keeping bodies resident. */
 #ifndef PAGE_POOL_RATE_MIN_WINDOW_NS
 # define PAGE_POOL_RATE_MIN_WINDOW_NS (RB_HRTIME_PER_SEC / 10)
 #endif
@@ -2877,6 +2879,97 @@ page_pool_add_arena(rb_global_objspace_t *g)
 }
 #endif
 
+#ifdef HAVE_MMAP
+/* The pool's clock.  rb_hrtime_now() is monotonic only when the platform has
+ * CLOCK_MONOTONIC; otherwise thread.c falls back to the wall clock, which NTP can step
+ * backwards.  Clamping here buys every timestamp in the pool a single non-decreasing
+ * source, so idle windows can't silently stretch and the newest_free_since ordering
+ * below holds by construction. */
+static rb_hrtime_t
+page_pool_now(rb_global_objspace_t *g)
+{
+    ASSERT_PAGE_POOL_LOCKED(g);
+
+    rb_hrtime_t now = rb_hrtime_now();
+    if (now < g->page_pool.clock_last) {
+        now = g->page_pool.clock_last;
+    }
+    g->page_pool.clock_last = now;
+    return now;
+}
+
+/* 2^(-i/16) in 16.16 fixed point, for i = 0..16. */
+static const uint32_t page_pool_exp2_neg_sixteenths[17] = {
+    65536, 62757, 60097, 57549, 55109, 52773, 50535, 48393, 46341,
+    44376, 42495, 40693, 38968, 37316, 35734, 34219, 32768,
+};
+
+/* value * 2^(-elapsed / page_pool_floor_half_life), in integer math: whole half-lives
+ * by shifting, the remainder by interpolating page_pool_exp2_neg_sixteenths. */
+static size_t
+page_pool_decay(size_t value, rb_hrtime_t elapsed)
+{
+    const rb_hrtime_t h = page_pool_floor_half_life;
+    rb_hrtime_t halvings = elapsed / h;
+    if (halvings >= sizeof(size_t) * CHAR_BIT) return 0;
+    value >>= halvings;
+
+    uint64_t x = (uint64_t)(elapsed % h) * 16;
+    unsigned int i = (unsigned int)(x / h);
+    uint64_t t = (x % h) * 65536 / h;
+    uint64_t lo = page_pool_exp2_neg_sixteenths[i], hi = page_pool_exp2_neg_sixteenths[i + 1];
+    uint64_t mult = lo - (((lo - hi) * t) >> 16);
+    return (size_t)(((uint64_t)value * mult) >> 16);
+}
+
+/* Roll the acquire-rate window and record a new peak.  Called from page_pool_acquire, so
+ * the measurement sits where the demand is generated: reclaim may now run on its own
+ * thread, paced by idle deadlines, which says nothing about how fast the heaps are
+ * consuming bodies.  Peak demand is stored rather than the floor itself; the floor is
+ * that peak decayed, computed when it is read. */
+static void
+page_pool_sample_demand(rb_global_objspace_t *g, rb_hrtime_t now)
+{
+    ASSERT_PAGE_POOL_LOCKED(g);
+
+    rb_hrtime_t dt = rb_hrtime_sub(now, g->page_pool.rate_window_start);
+    if (dt < PAGE_POOL_RATE_MIN_WINDOW_NS) return;
+    if (dt > PAGE_POOL_RATE_MAX_WINDOW_NS) dt = PAGE_POOL_RATE_MAX_WINDOW_NS;
+
+    size_t acquired = g->page_pool.acquired_in_window;
+    uint64_t scaled = (uint64_t)acquired > UINT64_MAX / page_pool_advise_idle
+        ? UINT64_MAX : (uint64_t)acquired * page_pool_advise_idle;
+    size_t demand = (size_t)(scaled / dt);
+
+    size_t decayed = page_pool_decay(g->page_pool.warm_peak,
+                                     rb_hrtime_sub(now, g->page_pool.warm_peak_time));
+    if (demand >= decayed) {
+        g->page_pool.warm_peak = demand;
+        g->page_pool.warm_peak_time = now;
+        decayed = demand;
+    }
+    g->page_pool.warm_floor = decayed;
+    g->page_pool.acquired_in_window = 0;
+    g->page_pool.rate_window_start = now;
+}
+
+/* The floor as of now: the bodies the recent acquire rate would consume in one
+ * page_pool_advise_idle, so a workload that keeps refilling its heaps keeps that many
+ * resident.  It rises to new demand the moment page_pool_sample_demand sees it and halves
+ * every page_pool_floor_half_life without it; the decay is computed from the time since
+ * the peak rather than compounded per call, so reading it more or less often does not
+ * change it. */
+static size_t
+page_pool_warm_floor(rb_global_objspace_t *g, rb_hrtime_t now)
+{
+    ASSERT_PAGE_POOL_LOCKED(g);
+
+    g->page_pool.warm_floor = page_pool_decay(g->page_pool.warm_peak,
+                                              rb_hrtime_sub(now, g->page_pool.warm_peak_time));
+    return g->page_pool.warm_floor;
+}
+#endif
+
 static struct heap_page_body *
 page_pool_acquire(struct page_arena **arena_out)
 {
@@ -2918,7 +3011,10 @@ page_pool_acquire(struct page_arena **arena_out)
             g->page_pool.arena_cursor += HEAP_PAGE_SIZE;
             *arena_out = g->page_pool.arena_current;
         }
-        if (body != NULL) g->page_pool.acquired_in_window++;
+        if (body != NULL) {
+            g->page_pool.acquired_in_window++;
+            page_pool_sample_demand(g, page_pool_now(g));
+        }
         rb_native_mutex_unlock(&g->page_pool.lock);
 
         if (body != NULL) {
@@ -2938,24 +3034,6 @@ page_pool_acquire(struct page_arena **arena_out)
 }
 
 #ifdef HAVE_MMAP
-/* The pool's clock.  rb_hrtime_now() is monotonic only when the platform has
- * CLOCK_MONOTONIC; otherwise thread.c falls back to the wall clock, which NTP can step
- * backwards.  Clamping here buys every timestamp in the pool a single non-decreasing
- * source, so idle windows can't silently stretch and the newest_free_since ordering
- * below holds by construction. */
-static rb_hrtime_t
-page_pool_now(rb_global_objspace_t *g)
-{
-    ASSERT_PAGE_POOL_LOCKED(g);
-
-    rb_hrtime_t now = rb_hrtime_now();
-    if (now < g->page_pool.clock_last) {
-        now = g->page_pool.clock_last;
-    }
-    g->page_pool.clock_last = now;
-    return now;
-}
-
 /* now comes from page_pool_now under the pool lock. */
 static void
 page_pool_release_locked(struct heap_page_body *body, struct page_arena *arena, rb_hrtime_t now)
@@ -3000,67 +3078,6 @@ page_pool_release(struct heap_page_body *body, struct page_arena *arena)
     }
 }
 
-#ifdef HAVE_MMAP
-/* 2^(-i/16) in 16.16 fixed point, for i = 0..16. */
-static const uint32_t page_pool_exp2_neg_sixteenths[17] = {
-    65536, 62757, 60097, 57549, 55109, 52773, 50535, 48393, 46341,
-    44376, 42495, 40693, 38968, 37316, 35734, 34219, 32768,
-};
-
-/* value * 2^(-elapsed / page_pool_floor_half_life), in integer math: whole half-lives
- * by shifting, the remainder by interpolating page_pool_exp2_neg_sixteenths. */
-static size_t
-page_pool_decay(size_t value, rb_hrtime_t elapsed)
-{
-    const rb_hrtime_t h = page_pool_floor_half_life;
-    rb_hrtime_t halvings = elapsed / h;
-    if (halvings >= sizeof(size_t) * CHAR_BIT) return 0;
-    value >>= halvings;
-
-    uint64_t x = (uint64_t)(elapsed % h) * 16;
-    unsigned int i = (unsigned int)(x / h);
-    uint64_t t = (x % h) * 65536 / h;
-    uint64_t lo = page_pool_exp2_neg_sixteenths[i], hi = page_pool_exp2_neg_sixteenths[i + 1];
-    uint64_t mult = lo - (((lo - hi) * t) >> 16);
-    return (size_t)(((uint64_t)value * mult) >> 16);
-}
-
-/* Size the warm floor from the pool-wide acquire rate: the bodies that rate would
- * consume in one page_pool_advise_idle, so a workload that keeps refilling its heaps
- * keeps that many bodies resident.  It rises to new demand at once and halves every
- * page_pool_floor_half_life without it.  The decay is computed from the time since the
- * last peak, not compounded per call, so it doesn't depend on how often reclaims run.
- * Windows shorter than PAGE_POOL_RATE_MIN_WINDOW_NS keep accumulating, so back-to-back
- * reclaims (several Ractors' GCs, or an absorb right after one) don't produce a rate
- * spike; windows longer than PAGE_POOL_RATE_MAX_WINDOW_NS are measured as that long. */
-static void
-page_pool_update_warm_floor(rb_global_objspace_t *g, rb_hrtime_t now)
-{
-    ASSERT_PAGE_POOL_LOCKED(g);
-    size_t acquired = g->page_pool.acquired_in_window;
-
-    rb_hrtime_t dt = rb_hrtime_sub(now, g->page_pool.rate_window_start);
-    if (dt < PAGE_POOL_RATE_MIN_WINDOW_NS) return;
-    if (dt > PAGE_POOL_RATE_MAX_WINDOW_NS) dt = PAGE_POOL_RATE_MAX_WINDOW_NS;
-
-    uint64_t scaled = (uint64_t)acquired > UINT64_MAX / page_pool_advise_idle
-        ? UINT64_MAX : (uint64_t)acquired * page_pool_advise_idle;
-    size_t demand = (size_t)(scaled / dt);
-
-    size_t decayed = page_pool_decay(g->page_pool.warm_peak,
-                                     rb_hrtime_sub(now, g->page_pool.warm_peak_time));
-    if (demand >= decayed) {
-        g->page_pool.warm_peak = demand;
-        g->page_pool.warm_peak_time = now;
-        decayed = demand;
-    }
-    g->page_pool.warm_floor = decayed;
-    g->page_pool.acquired_in_window = 0;
-    g->page_pool.rate_window_start = now;
-}
-
-#endif
-
 /* Whether a minor GC should run page_pool_reclaim: something may have become
  * reclaimable (see next_due) and no reclaim has run for
  * PAGE_POOL_MINOR_RECLAIM_INTERVAL_NS.  Read without the pool lock, so a backwards
@@ -3089,7 +3106,7 @@ page_pool_reclaim_due(rb_global_objspace_t *g)
  * Step A: madvise free bodies idle for page_pool_advise_idle, coalescing physically
  * adjacent ones into a single call.  The first warm_floor bodies in acquire order are
  * left alone: warm_floor is the recent acquire rate x page_pool_advise_idle,
- * decayed (see page_pool_update_warm_floor), so a workload that keeps refilling its
+ * decayed (see page_pool_warm_floor), so a workload that keeps refilling its
  * heaps keeps that many bodies resident.
  *
  * Step B: munmap arenas whose 32 bodies are all free, outside the warm floor, and idle
@@ -3121,7 +3138,6 @@ page_pool_reclaim(rb_global_objspace_t *g, size_t budget)
     const bool can_advise = os_page_size > 0 && HEAP_PAGE_SIZE % os_page_size == 0;
 
     rb_hrtime_t now = page_pool_now(g);
-    page_pool_update_warm_floor(g, now);
 
     /* Step A — advise idle cold bodies.  An arena's freelist is walked in acquire order
      * (arenas newest first, each freelist from its head) so the warm floor covers
@@ -3130,7 +3146,7 @@ page_pool_reclaim(rb_global_objspace_t *g, size_t budget)
      * free arena costs one madvise instead of 32.  The walk always completes -- Step B
      * needs every arena's has_warm -- but an exhausted budget stops the marking.  budget
      * is charged per body, so the calls issued can only undershoot it. */
-    size_t warm_left = g->page_pool.warm_floor;
+    size_t warm_left = page_pool_warm_floor(g, now);
     rb_hrtime_t next_due = RB_HRTIME_MAX;
     bool any_warm = false;
     bool deferred = false;

@@ -3356,7 +3356,7 @@ page_pool_reclaim(rb_global_objspace_t *g, size_t budget)
 }
 
 #if USE_PAGE_POOL_THREAD
-/* Whether reclamation runs on its own thread; RUBY_PAGE_POOL_THREAD=0 keeps it on the
+/* Whether reclamation runs on its own thread; RUBY_GC_PAGE_POOL_THREAD=0 keeps it on the
  * GC threads, which is also what a platform without the thread does. */
 #ifndef PAGE_POOL_THREAD_DEFAULT
 # define PAGE_POOL_THREAD_DEFAULT 1
@@ -12339,7 +12339,7 @@ rb_gc_impl_set_params(void *objspace_ptr)
 #if USE_PAGE_POOL_THREAD
     /* get_envparam_size rejects 0, which is the value that has to turn the thread off,
      * so this one is parsed here. */
-    const char *ptr = getenv("RUBY_PAGE_POOL_THREAD");
+    const char *ptr = getenv("RUBY_GC_PAGE_POOL_THREAD");
     if (ptr != NULL && *ptr != '\0') {
         char *end;
         long val = strtol(ptr, &end, 10);
@@ -12347,7 +12347,7 @@ rb_gc_impl_set_params(void *objspace_ptr)
             page_pool_thread_enabled = (val != 0);
         }
         else if (RTEST(ruby_verbose)) {
-            fprintf(stderr, "invalid value for RUBY_PAGE_POOL_THREAD: %s\n", ptr);
+            fprintf(stderr, "invalid value for RUBY_GC_PAGE_POOL_THREAD: %s\n", ptr);
         }
     }
 #endif

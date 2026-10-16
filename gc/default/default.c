@@ -2588,7 +2588,10 @@ global_page_index_remove(const struct heap_page *page)
 
 /* The bitmap is sized by address span but pays for itself per page, so cap it at the
  * size of the sorted array it accelerates (8 bytes per page) past a floor that keeps
- * small heaps indexed.  Only a span far sparser than our own arenas produce can trip it. */
+ * small heaps indexed.  Only a span far sparser than our own arenas produce can trip it.
+ * The cap tracks pages currently in sorted, not pages ever allocated: page_pool churn
+ * re-counts a reused body on every acquire, so a cumulative count would ratchet the cap
+ * open until it stopped bounding anything. */
 #define PAGE_BITMAP_BITS_PER_PAGE 64
 #define PAGE_BITMAP_MIN_PAGES     64
 #define PAGE_BITMAP_MIN_BITS      (PAGE_BITMAP_MIN_PAGES * PAGE_BITMAP_BITS_PER_PAGE)
@@ -2607,7 +2610,7 @@ page_bitmap_free(struct heap_page_bitmap *bm)
  * bitmap allocated after one was dropped would cover only the page that triggered it and
  * report every other live page as not-ours -- a missed conservative root, not a slow one. */
 static bool
-page_bitmap_ensure(rb_objspace_t *objspace, uintptr_t body)
+page_bitmap_ensure(rb_objspace_t *objspace, uintptr_t body, size_t incoming_pages)
 {
     struct heap_page_bitmap *bm = &objspace->heap_pages.page_bitmap;
 
@@ -2628,7 +2631,7 @@ page_bitmap_ensure(rb_objspace_t *objspace, uintptr_t body)
     }
 
     size_t need = (size_t)((new_end - new_base) >> HEAP_PAGE_ALIGN_LOG);
-    size_t cap = objspace->heap_pages.allocated_pages;
+    size_t cap = rb_darray_size(objspace->heap_pages.sorted) + incoming_pages;
     if (cap < PAGE_BITMAP_MIN_PAGES) cap = PAGE_BITMAP_MIN_PAGES;
     cap *= PAGE_BITMAP_BITS_PER_PAGE;
 
@@ -2665,13 +2668,13 @@ page_bitmap_ensure(rb_objspace_t *objspace, uintptr_t body)
 }
 
 static void
-page_bitmap_set(rb_objspace_t *objspace, const struct heap_page *page)
+page_bitmap_set(rb_objspace_t *objspace, const struct heap_page *page, size_t incoming_pages)
 {
     if (!HEAP_PAGE_ALLOC_USE_MMAP) return;
 
     uintptr_t body = (uintptr_t)page->body;
     GC_ASSERT((body & HEAP_PAGE_ALIGN_MASK) == 0);
-    if (!page_bitmap_ensure(objspace, body)) return;
+    if (!page_bitmap_ensure(objspace, body, incoming_pages)) return;
 
     struct heap_page_bitmap *bm = &objspace->heap_pages.page_bitmap;
     size_t i = PAGE_BITMAP_INDEX(bm, body);
@@ -3838,7 +3841,7 @@ heap_page_allocate(rb_objspace_t *objspace)
     page->arena = arena;
     page_body->header.page = page;
     page->objspace = objspace;
-    page_bitmap_set(objspace, page);
+    page_bitmap_set(objspace, page, 0);
 
     objspace->heap_pages.allocated_pages++;
 
@@ -11047,9 +11050,6 @@ objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
         rb_objspace_t *objspace = dst; /* for the heap_pages_* macros */
         struct heap_page *page = NULL;
         size_t srcn = rb_darray_size(src->heap_pages.sorted);
-        /* Before the loop: page_bitmap_ensure sizes dst's bitmap against this count, and
-         * the absorbed pages are what widen the span it has to cover. */
-        objspace->heap_pages.allocated_pages += src->heap_pages.allocated_pages;
         for (size_t i = 0; i < srcn; i++) {
             page = rb_darray_get(src->heap_pages.sorted, i);
             /* Residents of the empty pool (no live objects) are returned to page_pool rather
@@ -11076,11 +11076,15 @@ objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
                 else hi = mid;
             }
             rb_darray_insert_without_gc(&objspace->heap_pages.sorted, hi, page);
-            page_bitmap_set(objspace, page);
+            /* src's pages arrive in ascending address order, so the first one already
+             * widens the span by nearly the full amount: size the bitmap against the
+             * whole incoming batch, not the count inserted so far. */
+            page_bitmap_set(objspace, page, srcn - i - 1);
 
             if (heap_pages_lomem == 0 || heap_pages_lomem > start) heap_pages_lomem = start;
             if (heap_pages_himem < end) heap_pages_himem = end;
         }
+        objspace->heap_pages.allocated_pages += src->heap_pages.allocated_pages;
         objspace->heap_pages.freed_pages += src->heap_pages.freed_pages;
         rb_darray_free_without_gc(src->heap_pages.sorted);
         src->heap_pages.sorted = NULL;

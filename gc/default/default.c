@@ -405,20 +405,6 @@ int ruby_rgengc_debug;
 # define GC_DEBUG_STRESS_TO_CLASS RUBY_DEBUG
 #endif
 
-/* GC_PAGE_BITMAP_VERIFY
- * Cross-check every page_bitmap lookup against the heap_pages.sorted bsearch it
- * replaced, so a missed bitmap maintenance site fails loudly on the first
- * conservative scan instead of silently resolving to a freed page.
- * Needs RGENGC_CHECK_MODE > 0 as well: the check is a GC_ASSERT, so on a build
- * without it this knob compiles the bsearch out and verifies nothing.
- * 0: disable.
- * 1: enable.  Very slow -- both lookups run on every call, so a conservative scan
- *    pays a bsearch per in-range stack word.  Off by default for that reason.
- */
-#ifndef GC_PAGE_BITMAP_VERIFY
-# define GC_PAGE_BITMAP_VERIFY 0
-#endif
-
 typedef enum {
     GPR_FLAG_NONE               = 0x000,
     /* major reason */
@@ -4543,9 +4529,7 @@ heap_page_for_ptr(rb_objspace_t *objspace, uintptr_t ptr)
                 page = GET_PAGE_BODY(ptr)->header.page;
             }
         }
-#if GC_PAGE_BITMAP_VERIFY
         GC_ASSERT(page == heap_page_for_ptr_bsearch(objspace, ptr));
-#endif
         return page;
     }
 

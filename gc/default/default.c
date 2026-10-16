@@ -3815,9 +3815,15 @@ heap_page_allocate(rb_objspace_t *objspace)
         rb_memerror();
     }
 
-    uintptr_t start = (uintptr_t)page_body + sizeof(struct heap_page_header);
-    uintptr_t end = (uintptr_t)page_body + HEAP_PAGE_SIZE;
+    uintptr_t body = (uintptr_t)page_body;
+    uintptr_t start = body + sizeof(struct heap_page_header);
+    uintptr_t end = body + HEAP_PAGE_SIZE;
 
+    /* Key on body, as objspace_absorb does: sorted is searched by body range, and a
+     * page detached to the empty pool has start == 0 while staying in sorted.  Only
+     * reaching here with the empty pool drained keeps a start key monotonic, which is
+     * a guarantee heap_page_allocate_and_initialize happens to provide rather than one
+     * this search states for itself. */
     size_t lo = 0;
     size_t hi = rb_darray_size(objspace->heap_pages.sorted);
     while (lo < hi) {
@@ -3825,10 +3831,10 @@ heap_page_allocate(rb_objspace_t *objspace)
 
         size_t mid = (lo + hi) / 2;
         mid_page = rb_darray_get(objspace->heap_pages.sorted, mid);
-        if ((uintptr_t)mid_page->start < start) {
+        if ((uintptr_t)mid_page->body < body) {
             lo = mid + 1;
         }
-        else if ((uintptr_t)mid_page->start > start) {
+        else if ((uintptr_t)mid_page->body > body) {
             hi = mid;
         }
         else {
@@ -8306,6 +8312,16 @@ gc_verify_internal_consistency_(rb_objspace_t *objspace, bool world_stopped)
     data.objspace = objspace;
     data.world_stopped = world_stopped;
     gc_report(5, objspace, "gc_verify_internal_consistency: start\n");
+
+    /* heap_page_for_ptr_bsearch orders by body address, and a page detached to the
+     * empty pool has start == 0 while staying in sorted, so an insertion that compared
+     * page->start would leave sorted unordered and the bsearch would then miss live
+     * pages. */
+    for (size_t i = 1; i < rb_darray_size(objspace->heap_pages.sorted); i++) {
+        struct heap_page *prev = rb_darray_get(objspace->heap_pages.sorted, i - 1);
+        struct heap_page *page = rb_darray_get(objspace->heap_pages.sorted, i);
+        GC_ASSERT((uintptr_t)prev->body < (uintptr_t)page->body);
+    }
 
     /* The page bitmap must agree with sorted in both directions.  A missing bit only
      * costs speed, but a bit left set over a freed body resolves to a dangling

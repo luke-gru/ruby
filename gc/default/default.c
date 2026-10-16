@@ -687,6 +687,10 @@ typedef struct rb_objspace {
         unsigned int during_gc : 1;
         unsigned int during_global_gc : 1;
         unsigned int during_compacting : 1;
+        /* Compaction may have mprotected a page body PROT_NONE, so no body header in this
+         * objspace may be read.  Set on the first lock_page_body and cleared only once
+         * compaction has unprotected everything, so it over-reports, never under-reports. */
+        unsigned int page_bodies_maybe_locked : 1;
         unsigned int gc_lock_barrier : 1;
         unsigned int during_reference_updating : 1;
         unsigned int during_minor_gc : 1;
@@ -4526,7 +4530,16 @@ heap_page_for_ptr(rb_objspace_t *objspace, uintptr_t ptr)
         if (body >= bm->base) {
             size_t i = PAGE_BITMAP_INDEX(bm, body);
             if (i < bm->nbits && (PAGE_BITMAP_WORD(bm, i) & PAGE_BITMAP_BIT(i))) {
-                page = GET_PAGE_BODY(ptr)->header.page;
+                /* The bitmap answers membership; the caller wants the page, and the only
+                 * O(1) body->page map is in the body header, which compaction mprotects
+                 * PROT_NONE along with the rest of the body.  While that is possible, fall
+                 * back to the bsearch, which reads struct heap_page and never a body. */
+                if (RB_UNLIKELY(objspace->flags.page_bodies_maybe_locked)) {
+                    page = heap_page_for_ptr_bsearch(objspace, ptr);
+                }
+                else {
+                    page = GET_PAGE_BODY(ptr)->header.page;
+                }
             }
         }
         GC_ASSERT(page == heap_page_for_ptr_bsearch(objspace, ptr));
@@ -5515,6 +5528,9 @@ enum {HEAP_PAGE_LOCK = PROT_NONE, HEAP_PAGE_UNLOCK = PROT_READ | PROT_WRITE};
 static void
 lock_page_body(rb_objspace_t *objspace, struct heap_page_body *body)
 {
+    /* Before the mprotect: a reader must never see a clear flag over a locked body. */
+    objspace->flags.page_bodies_maybe_locked = TRUE;
+
     if (!protect_page_body(body, HEAP_PAGE_LOCK)) {
         rb_bug("Couldn't protect page %p, errno: %s", (void *)body, strerror(errno));
     }
@@ -5818,6 +5834,7 @@ gc_compact_finish(rb_objspace_t *objspace)
         rb_heap_t *heap = &heaps[i];
         gc_unprotect_pages(objspace, heap);
     }
+    objspace->flags.page_bodies_maybe_locked = FALSE;
 
     if (!global_objspace->global_gc.compacting) uninstall_handlers();
 

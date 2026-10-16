@@ -514,8 +514,9 @@ struct heap_page_body {
 
 /* Reindex of an objspace's heap_pages.sorted by body address: bit i is set iff the body
  * at base + i * HEAP_PAGE_SIZE is in sorted, which is exactly when dereferencing that
- * body's header is safe.  base stays PAGE_BITMAP_BASE_ALIGN aligned so growing downward
- * shifts whole bits_t words.  bits == NULL means fall back to the bsearch. */
+ * body's header is safe.  base stays PAGE_BITMAP_BASE_ALIGN aligned, which rounds a
+ * reshape's base down to a whole word of page bodies.  bits == NULL means fall back to
+ * the bsearch. */
 struct heap_page_bitmap {
     bits_t *bits;
     uintptr_t base;
@@ -2599,9 +2600,8 @@ page_bitmap_free(struct heap_page_bitmap *bm)
 }
 
 /* Widen the bitmap to cover body, or give up on indexing this objspace for good.  Giving
- * up MUST be sticky: there is no path that rebuilds the bitmap from sorted, so a second
- * bitmap allocated after one was dropped would cover only the page that triggered it and
- * report every other live page as not-ours -- a missed conservative root, not a slow one. */
+ * up stays sticky: a span sparse enough to blow the cap is unlikely to become dense
+ * again, and the bsearch it falls back to is a correct answer, only a slower one. */
 static bool
 page_bitmap_ensure(rb_objspace_t *objspace, uintptr_t body, size_t incoming_pages)
 {
@@ -2612,31 +2612,52 @@ page_bitmap_ensure(rb_objspace_t *objspace, uintptr_t body, size_t incoming_page
         return true;
     }
 
-    uintptr_t old_base = bm->base;
-    size_t old_nbits = bm->nbits;
-    uintptr_t new_base = body & ~(PAGE_BITMAP_BASE_ALIGN - 1);
-    uintptr_t new_end = body + HEAP_PAGE_SIZE;
-
-    if (bm->bits != NULL) {
-        if (old_base < new_base) new_base = old_base;
-        uintptr_t old_end = old_base + (uintptr_t)old_nbits * HEAP_PAGE_SIZE;
-        if (old_end > new_end) new_end = old_end;
+    /* Measure the span by where pages actually are, never by how far the current bitmap
+     * reaches: the first allocation rounds up to PAGE_BITMAP_MIN_BITS, which is also what
+     * the cap floors at, so treating old_base + old_nbits pages as occupied leaves no
+     * slack at all -- the first arena mapped below base then exceeds the cap and turns
+     * indexing off for good.  sorted is ordered by body, so its ends bracket every page. */
+    size_t nsorted = rb_darray_size(objspace->heap_pages.sorted);
+    uintptr_t lo = body;
+    uintptr_t hi = body + HEAP_PAGE_SIZE;
+    if (nsorted > 0) {
+        uintptr_t first = (uintptr_t)rb_darray_get(objspace->heap_pages.sorted, 0)->body;
+        uintptr_t last = (uintptr_t)rb_darray_get(objspace->heap_pages.sorted, nsorted - 1)->body;
+        if (first < lo) lo = first;
+        if (last + HEAP_PAGE_SIZE > hi) hi = last + HEAP_PAGE_SIZE;
     }
 
-    size_t need = (size_t)((new_end - new_base) >> HEAP_PAGE_ALIGN_LOG);
-    size_t cap = rb_darray_size(objspace->heap_pages.sorted) + incoming_pages;
+    size_t old_nbits = bm->nbits;
+    uintptr_t new_base = lo & ~(PAGE_BITMAP_BASE_ALIGN - 1);
+
+    size_t need = (size_t)((hi - new_base) >> HEAP_PAGE_ALIGN_LOG);
+    size_t cap = nsorted + incoming_pages;
     if (cap < PAGE_BITMAP_MIN_PAGES) cap = PAGE_BITMAP_MIN_PAGES;
     cap *= PAGE_BITMAP_BITS_PER_PAGE;
 
     if (need > cap) {
+        /* Silent and sticky, so say so: every lookup from here on is a bsearch. */
+        gc_report(1, objspace, "page_bitmap_ensure: indexing off, span %"PRIuSIZE" pages over "
+                  "%"PRIuSIZE" sorted pages (%#"PRIxVALUE"..%#"PRIxVALUE")\n",
+                  need, nsorted, (VALUE)new_base, (VALUE)hi);
         page_bitmap_free(bm);
         bm->off = true;
         return false;
     }
 
-    size_t new_nbits = old_nbits ? old_nbits : PAGE_BITMAP_MIN_BITS;
+    size_t new_nbits = old_nbits > PAGE_BITMAP_MIN_BITS ? old_nbits : PAGE_BITMAP_MIN_BITS;
     while (new_nbits < need) new_nbits *= 2;
     if (new_nbits > cap) new_nbits = need;
+
+    /* Centre the occupied span in the map.  Linux places each new arena below the last
+     * and macOS above, and slack that all sits above base means growth in the other
+     * direction leaves the map almost at once and reshapes per arena.  Moving base down
+     * by whole PAGE_BITMAP_BASE_ALIGN units keeps it aligned, and moving it by at most
+     * half the slack keeps hi inside the map. */
+    size_t slack_units = (new_nbits - need) / BITS_BITLENGTH / 2;
+    uintptr_t below = (uintptr_t)slack_units * PAGE_BITMAP_BASE_ALIGN;
+    if (new_base >= below) new_base -= below;
+    GC_ASSERT(new_base + (uintptr_t)new_nbits * HEAP_PAGE_SIZE >= hi);
 
     bits_t *new_bits = calloc(PAGE_BITMAP_WORDS(new_nbits), sizeof(bits_t));
     if (new_bits == NULL) {
@@ -2646,17 +2667,23 @@ page_bitmap_ensure(rb_objspace_t *objspace, uintptr_t body, size_t incoming_page
         return false;
     }
 
-    if (bm->bits != NULL) {
-        size_t shift = (size_t)((old_base - new_base) >> HEAP_PAGE_ALIGN_LOG);
-        GC_ASSERT(shift % BITS_BITLENGTH == 0);
-        memcpy(new_bits + shift / BITS_BITLENGTH, bm->bits,
-               PAGE_BITMAP_WORDS(old_nbits) * sizeof(bits_t));
-        free(bm->bits);
-    }
-
+    free(bm->bits);
     bm->bits = new_bits;
     bm->base = new_base;
     bm->nbits = new_nbits;
+
+    /* Repopulate from sorted instead of shifting the old bits over: a reshape can move
+     * base either way and can land on a map narrower than the last one, and rebuilding
+     * from the array this is an index of makes all of those the same case.  The caller
+     * sets body's own bit, so a call site that has not inserted into sorted yet still
+     * ends up consistent. */
+    for (size_t i = 0; i < nsorted; i++) {
+        struct heap_page *page = rb_darray_get(objspace->heap_pages.sorted, i);
+        size_t bit = PAGE_BITMAP_INDEX(bm, (uintptr_t)page->body);
+        GC_ASSERT(bit < bm->nbits);
+        PAGE_BITMAP_WORD(bm, bit) |= PAGE_BITMAP_BIT(bit);
+    }
+
     return true;
 }
 

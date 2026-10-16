@@ -408,16 +408,15 @@ int ruby_rgengc_debug;
 /* GC_PAGE_BITMAP_VERIFY
  * Cross-check every page_bitmap lookup against the heap_pages.sorted bsearch it
  * replaced, so a missed bitmap maintenance site fails loudly on the first
- * conservative scan instead of silently resolving to a freed page.  The check
- * rb_bug()s rather than GC_ASSERT()ing, because GC_ASSERT is gated on
- * RGENGC_CHECK_MODE and would compile the cross-check out of a plain RUBY_DEBUG
- * build -- the build you reach for when hunting exactly this bug.
+ * conservative scan instead of silently resolving to a freed page.
+ * Needs RGENGC_CHECK_MODE > 0 as well: the check is a GC_ASSERT, so on a build
+ * without it this knob compiles the bsearch out and verifies nothing.
  * 0: disable.
- * 1: enable (both lookups run on every call, so conservative scans pay a bsearch
- *    per stack word; set it to 0 explicitly to profile a debug build).
+ * 1: enable.  Very slow -- both lookups run on every call, so a conservative scan
+ *    pays a bsearch per in-range stack word.  Off by default for that reason.
  */
 #ifndef GC_PAGE_BITMAP_VERIFY
-# define GC_PAGE_BITMAP_VERIFY RUBY_DEBUG
+# define GC_PAGE_BITMAP_VERIFY 0
 #endif
 
 typedef enum {
@@ -4522,12 +4521,7 @@ heap_page_for_ptr_bsearch(rb_objspace_t *objspace, uintptr_t ptr)
  * header -- and so resolving the page in O(1) -- safe for an address that may be
  * anything at all.  Without the bitmap this is a bsearch whose comparator dereferences
  * a heap_page per probe, so a rejected word costs a chain of dependent misses. */
-#if GC_PAGE_BITMAP_VERIFY
-/* Not PUREFUNC while verifying: CSE of a redundant call would skip the cross-check. */
-static inline struct heap_page *heap_page_for_ptr(rb_objspace_t *objspace, uintptr_t ptr);
-#else
 PUREFUNC(static inline struct heap_page *heap_page_for_ptr(rb_objspace_t *objspace, uintptr_t ptr);)
-#endif
 static inline struct heap_page *
 heap_page_for_ptr(rb_objspace_t *objspace, uintptr_t ptr)
 {
@@ -4550,12 +4544,7 @@ heap_page_for_ptr(rb_objspace_t *objspace, uintptr_t ptr)
             }
         }
 #if GC_PAGE_BITMAP_VERIFY
-        struct heap_page *expected = heap_page_for_ptr_bsearch(objspace, ptr);
-        if (page != expected) {
-            rb_bug("page bitmap disagrees with heap_pages.sorted for %p: "
-                   "bitmap says %p, bsearch says %p",
-                   (void *)ptr, (void *)page, (void *)expected);
-        }
+        GC_ASSERT(page == heap_page_for_ptr_bsearch(objspace, ptr));
 #endif
         return page;
     }

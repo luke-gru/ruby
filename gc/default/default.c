@@ -405,6 +405,17 @@ int ruby_rgengc_debug;
 # define GC_DEBUG_STRESS_TO_CLASS RUBY_DEBUG
 #endif
 
+/* GC_PAGE_BITMAP_VERIFY
+ * Cross-check every page_bitmap lookup against the heap_pages.sorted bsearch it
+ * replaced, so a missed bitmap maintenance site fails loudly on the first
+ * conservative scan instead of silently resolving to a freed page.
+ * 0: disable.
+ * 1: enable (very slow: both lookups run on every call).
+ */
+#ifndef GC_PAGE_BITMAP_VERIFY
+# define GC_PAGE_BITMAP_VERIFY 0
+#endif
+
 typedef enum {
     GPR_FLAG_NONE               = 0x000,
     /* major reason */
@@ -510,6 +521,17 @@ struct heap_page_body {
     struct heap_page_header header;
     /* char gap[];      */
     /* RVALUE values[]; */
+};
+
+/* Reindex of an objspace's heap_pages.sorted by body address: bit i is set iff the body
+ * at base + i * HEAP_PAGE_SIZE is in sorted, which is exactly when dereferencing that
+ * body's header is safe.  base stays PAGE_BITMAP_BASE_ALIGN aligned so growing downward
+ * shifts whole bits_t words.  bits == NULL means fall back to the bsearch. */
+struct heap_page_bitmap {
+    bits_t *bits;
+    uintptr_t base;
+    size_t nbits;
+    bool off;      /* sticky once set: span too sparse to index, stay on the bsearch */
 };
 
 #define STACK_CHUNK_SIZE 500
@@ -715,6 +737,10 @@ typedef struct rb_objspace {
         size_t freed_pages;
         uintptr_t range[2];
         size_t freeable_pages;
+
+        /* Owned by this objspace alone, so is_pointer_to_heap may read it during a
+         * local GC -- the global page_index may not be. */
+        struct heap_page_bitmap page_bitmap;
 
         size_t allocatable_bytes;
 
@@ -2552,10 +2578,127 @@ global_page_index_remove(const struct heap_page *page)
     rb_native_mutex_unlock(&g->page_pool.lock);
 }
 
+/* Keeping base aligned to a whole bits_t worth of page bodies is what lets
+ * page_bitmap_ensure grow downward with a word-granular copy instead of a bit shift. */
+#define PAGE_BITMAP_BASE_ALIGN  ((uintptr_t)BITS_BITLENGTH * HEAP_PAGE_SIZE)
+#define PAGE_BITMAP_WORDS(nbits) CEILDIV(nbits, BITS_BITLENGTH)
+#define PAGE_BITMAP_INDEX(bm, body) (size_t)(((body) - (bm)->base) >> HEAP_PAGE_ALIGN_LOG)
+#define PAGE_BITMAP_WORD(bm, i) ((bm)->bits[(i) / BITS_BITLENGTH])
+#define PAGE_BITMAP_BIT(i)      ((bits_t)1 << ((i) & (BITS_BITLENGTH - 1)))
+
+/* The bitmap is sized by address span but pays for itself per page, so cap it at the
+ * size of the sorted array it accelerates (8 bytes per page) past a floor that keeps
+ * small heaps indexed.  Only a span far sparser than our own arenas produce can trip it. */
+#define PAGE_BITMAP_BITS_PER_PAGE 64
+#define PAGE_BITMAP_MIN_PAGES     64
+#define PAGE_BITMAP_MIN_BITS      (PAGE_BITMAP_MIN_PAGES * PAGE_BITMAP_BITS_PER_PAGE)
+
+static void
+page_bitmap_free(struct heap_page_bitmap *bm)
+{
+    free(bm->bits);
+    bm->bits = NULL;
+    bm->base = 0;
+    bm->nbits = 0;
+}
+
+/* Widen the bitmap to cover body, or give up on indexing this objspace for good.  Giving
+ * up MUST be sticky: there is no path that rebuilds the bitmap from sorted, so a second
+ * bitmap allocated after one was dropped would cover only the page that triggered it and
+ * report every other live page as not-ours -- a missed conservative root, not a slow one. */
+static bool
+page_bitmap_ensure(rb_objspace_t *objspace, uintptr_t body)
+{
+    struct heap_page_bitmap *bm = &objspace->heap_pages.page_bitmap;
+
+    if (bm->off) return false;
+    if (bm->bits != NULL && body >= bm->base && PAGE_BITMAP_INDEX(bm, body) < bm->nbits) {
+        return true;
+    }
+
+    uintptr_t old_base = bm->base;
+    size_t old_nbits = bm->nbits;
+    uintptr_t new_base = body & ~(PAGE_BITMAP_BASE_ALIGN - 1);
+    uintptr_t new_end = body + HEAP_PAGE_SIZE;
+
+    if (bm->bits != NULL) {
+        if (old_base < new_base) new_base = old_base;
+        uintptr_t old_end = old_base + (uintptr_t)old_nbits * HEAP_PAGE_SIZE;
+        if (old_end > new_end) new_end = old_end;
+    }
+
+    size_t need = (size_t)((new_end - new_base) >> HEAP_PAGE_ALIGN_LOG);
+    size_t cap = objspace->heap_pages.allocated_pages;
+    if (cap < PAGE_BITMAP_MIN_PAGES) cap = PAGE_BITMAP_MIN_PAGES;
+    cap *= PAGE_BITMAP_BITS_PER_PAGE;
+
+    if (need > cap) {
+        page_bitmap_free(bm);
+        bm->off = true;
+        return false;
+    }
+
+    size_t new_nbits = old_nbits ? old_nbits : PAGE_BITMAP_MIN_BITS;
+    while (new_nbits < need) new_nbits *= 2;
+    if (new_nbits > cap) new_nbits = need;
+
+    bits_t *new_bits = calloc(PAGE_BITMAP_WORDS(new_nbits), sizeof(bits_t));
+    if (new_bits == NULL) {
+        /* Not fatal: the bsearch is still a correct answer. */
+        page_bitmap_free(bm);
+        bm->off = true;
+        return false;
+    }
+
+    if (bm->bits != NULL) {
+        size_t shift = (size_t)((old_base - new_base) >> HEAP_PAGE_ALIGN_LOG);
+        GC_ASSERT(shift % BITS_BITLENGTH == 0);
+        memcpy(new_bits + shift / BITS_BITLENGTH, bm->bits,
+               PAGE_BITMAP_WORDS(old_nbits) * sizeof(bits_t));
+        free(bm->bits);
+    }
+
+    bm->bits = new_bits;
+    bm->base = new_base;
+    bm->nbits = new_nbits;
+    return true;
+}
+
+static void
+page_bitmap_set(rb_objspace_t *objspace, const struct heap_page *page)
+{
+    if (!HEAP_PAGE_ALLOC_USE_MMAP) return;
+
+    uintptr_t body = (uintptr_t)page->body;
+    GC_ASSERT((body & HEAP_PAGE_ALIGN_MASK) == 0);
+    if (!page_bitmap_ensure(objspace, body)) return;
+
+    struct heap_page_bitmap *bm = &objspace->heap_pages.page_bitmap;
+    size_t i = PAGE_BITMAP_INDEX(bm, body);
+    GC_ASSERT(i < bm->nbits);
+    PAGE_BITMAP_WORD(bm, i) |= PAGE_BITMAP_BIT(i);
+}
+
+/* Must run before the body is freed or returned to the pool: a set bit is what licenses
+ * dereferencing that body's header, so one left behind turns a slow answer into a wrong one. */
+static void
+page_bitmap_clear(rb_objspace_t *objspace, const struct heap_page *page)
+{
+    struct heap_page_bitmap *bm = &objspace->heap_pages.page_bitmap;
+    if (bm->bits == NULL) return;
+
+    uintptr_t body = (uintptr_t)page->body;
+    if (body < bm->base) return;
+    size_t i = PAGE_BITMAP_INDEX(bm, body);
+    if (i >= bm->nbits) return;
+    PAGE_BITMAP_WORD(bm, i) &= ~PAGE_BITMAP_BIT(i);
+}
+
 static void
 heap_page_free(rb_objspace_t *objspace, struct heap_page *page)
 {
     global_page_index_remove(page);
+    page_bitmap_clear(objspace, page);
     objspace->heap_pages.freed_pages++;
     heap_page_body_free(page->body, page->arena);
     free(page);
@@ -2574,6 +2717,7 @@ heap_pages_free_batch(rb_objspace_t *objspace, struct heap_page *pages)
     bool released_to_pool = false;
     for (struct heap_page *page = pages; page != NULL; page = page->free_next) {
         global_page_index_remove_locked(page);
+        page_bitmap_clear(objspace, page);
         if (HEAP_PAGE_ALLOC_USE_MMAP) {
 #ifdef HAVE_MMAP
             page_pool_release_locked(page->body, page->arena, now);
@@ -3694,6 +3838,7 @@ heap_page_allocate(rb_objspace_t *objspace)
     page->arena = arena;
     page_body->header.page = page;
     page->objspace = objspace;
+    page_bitmap_set(objspace, page);
 
     objspace->heap_pages.allocated_pages++;
 
@@ -4342,16 +4487,11 @@ ptr_in_page_body_p(const void *ptr, const void *memb)
     }
 }
 
-PUREFUNC(static inline struct heap_page *heap_page_for_ptr(rb_objspace_t *objspace, uintptr_t ptr);)
+PUREFUNC(static inline struct heap_page *heap_page_for_ptr_bsearch(rb_objspace_t *objspace, uintptr_t ptr);)
 static inline struct heap_page *
-heap_page_for_ptr(rb_objspace_t *objspace, uintptr_t ptr)
+heap_page_for_ptr_bsearch(rb_objspace_t *objspace, uintptr_t ptr)
 {
     struct heap_page **res;
-
-    if (ptr < (uintptr_t)heap_pages_lomem ||
-            ptr > (uintptr_t)heap_pages_himem) {
-        return NULL;
-    }
 
     res = bsearch((void *)ptr, rb_darray_ref(objspace->heap_pages.sorted, 0),
                   rb_darray_size(objspace->heap_pages.sorted), sizeof(struct heap_page *),
@@ -4363,6 +4503,41 @@ heap_page_for_ptr(rb_objspace_t *objspace, uintptr_t ptr)
     else {
         return NULL;
     }
+}
+
+/* A set bit means the body is in heap_pages.sorted, which is what makes reading its
+ * header -- and so resolving the page in O(1) -- safe for an address that may be
+ * anything at all.  Without the bitmap this is a bsearch whose comparator dereferences
+ * a heap_page per probe, so a rejected word costs a chain of dependent misses. */
+PUREFUNC(static inline struct heap_page *heap_page_for_ptr(rb_objspace_t *objspace, uintptr_t ptr);)
+static inline struct heap_page *
+heap_page_for_ptr(rb_objspace_t *objspace, uintptr_t ptr)
+{
+    if (ptr < (uintptr_t)heap_pages_lomem ||
+            ptr > (uintptr_t)heap_pages_himem) {
+        return NULL;
+    }
+
+    const struct heap_page_bitmap *bm = &objspace->heap_pages.page_bitmap;
+    if (RB_LIKELY(bm->bits != NULL)) {
+        struct heap_page *page = NULL;
+        uintptr_t body = (uintptr_t)GET_PAGE_BODY(ptr);
+
+        /* Implied by the lomem check and base <= lomem, but two instructions to rule
+         * out an underflowed index. */
+        if (body >= bm->base) {
+            size_t i = PAGE_BITMAP_INDEX(bm, body);
+            if (i < bm->nbits && (PAGE_BITMAP_WORD(bm, i) & PAGE_BITMAP_BIT(i))) {
+                page = GET_PAGE_BODY(ptr)->header.page;
+            }
+        }
+#if GC_PAGE_BITMAP_VERIFY
+        GC_ASSERT(page == heap_page_for_ptr_bsearch(objspace, ptr));
+#endif
+        return page;
+    }
+
+    return heap_page_for_ptr_bsearch(objspace, ptr);
 }
 
 PUREFUNC(static inline bool is_pointer_to_heap(rb_objspace_t *objspace, const void *ptr);)
@@ -8115,6 +8290,29 @@ gc_verify_internal_consistency_(rb_objspace_t *objspace, bool world_stopped)
     data.world_stopped = world_stopped;
     gc_report(5, objspace, "gc_verify_internal_consistency: start\n");
 
+    /* The page bitmap must agree with sorted in both directions.  A missing bit only
+     * costs speed, but a bit left set over a freed body resolves to a dangling
+     * heap_page, so count the set bits too rather than just checking membership. */
+    {
+        const struct heap_page_bitmap *bm = &objspace->heap_pages.page_bitmap;
+        if (bm->bits != NULL) {
+            for (size_t i = 0; i < rb_darray_size(objspace->heap_pages.sorted); i++) {
+                struct heap_page *page = rb_darray_get(objspace->heap_pages.sorted, i);
+                uintptr_t body = (uintptr_t)page->body;
+                GC_ASSERT(body >= bm->base);
+                size_t bit = PAGE_BITMAP_INDEX(bm, body);
+                GC_ASSERT(bit < bm->nbits);
+                GC_ASSERT(PAGE_BITMAP_WORD(bm, bit) & PAGE_BITMAP_BIT(bit));
+            }
+
+            size_t set = 0;
+            for (size_t w = 0; w < PAGE_BITMAP_WORDS(bm->nbits); w++) {
+                set += rb_popcount_intptr(bm->bits[w]);
+            }
+            GC_ASSERT(set == rb_darray_size(objspace->heap_pages.sorted));
+        }
+    }
+
     /* check relations */
     for (size_t i = 0; i < rb_darray_size(objspace->heap_pages.sorted); i++) {
         struct heap_page *page = rb_darray_get(objspace->heap_pages.sorted, i);
@@ -10849,6 +11047,9 @@ objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
         rb_objspace_t *objspace = dst; /* for the heap_pages_* macros */
         struct heap_page *page = NULL;
         size_t srcn = rb_darray_size(src->heap_pages.sorted);
+        /* Before the loop: page_bitmap_ensure sizes dst's bitmap against this count, and
+         * the absorbed pages are what widen the span it has to cover. */
+        objspace->heap_pages.allocated_pages += src->heap_pages.allocated_pages;
         for (size_t i = 0; i < srcn; i++) {
             page = rb_darray_get(src->heap_pages.sorted, i);
             /* Residents of the empty pool (no live objects) are returned to page_pool rather
@@ -10875,14 +11076,15 @@ objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
                 else hi = mid;
             }
             rb_darray_insert_without_gc(&objspace->heap_pages.sorted, hi, page);
+            page_bitmap_set(objspace, page);
 
             if (heap_pages_lomem == 0 || heap_pages_lomem > start) heap_pages_lomem = start;
             if (heap_pages_himem < end) heap_pages_himem = end;
         }
-        objspace->heap_pages.allocated_pages += src->heap_pages.allocated_pages;
         objspace->heap_pages.freed_pages += src->heap_pages.freed_pages;
         rb_darray_free_without_gc(src->heap_pages.sorted);
         src->heap_pages.sorted = NULL;
+        page_bitmap_free(&src->heap_pages.page_bitmap);
         /* The empty_pages chain's structs were freed in the loop above. */
         src->empty_pages = NULL;
         src->empty_pages_count = 0;
@@ -14033,6 +14235,7 @@ rb_gc_impl_objspace_free(void *objspace_ptr)
         heap_page_free(objspace, rb_darray_get(objspace->heap_pages.sorted, i));
     }
     rb_darray_free_without_gc(objspace->heap_pages.sorted);
+    page_bitmap_free(&objspace->heap_pages.page_bitmap);
     heap_pages_lomem = 0;
     heap_pages_himem = 0;
 

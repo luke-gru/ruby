@@ -960,6 +960,12 @@ typedef struct rb_global_objspace {
      * under the barrier; readers (gc_need_global_p) may be racy. */
     size_t zombie_pages_survivors;
 
+    /* The last global cycle ran with only one Ractor alive and nothing has been absorbed
+     * since, so it saw everything a sole Ractor's next global cycle would: the zombies it
+     * left are referenced and the process is as single as it gets.  Until then, the sole
+     * Ractor's next GC is promoted (see gc_need_global_p).  Racy reads are fine. */
+    bool sole_ractor_settled;
+
     /* An objspace merge (objspace_absorb) is running: suppress the cross-objspace
      * verifier while the graph is in flux.  Written by the absorbing thread, read by
      * verification with the world stopped. */
@@ -9892,6 +9898,15 @@ gc_need_global_p(rb_objspace_t *objspace)
     /* A Ractor's death must not stop the world, so the retire GC stays local. */
     if (objspace->flags.during_postmortem) return false;
     if (objspace->shareable_objects > objspace->shareable_objects_limit) return true;
+    /* Down to one Ractor but still multi (zombies, or an absorb since the last global
+     * cycle): the page trigger can't help, as no more Ractors will die to push it.  The
+     * last cycle ran while the zombies' Ractor objects were still referenced and counted
+     * them as survivors, and only a global sweep frees a Ractor object, so promote once.
+     * That cycle frees the Ractor objects, their merges reset sole_ractor_settled and the
+     * next GC is global again to clear gc_absorbed_since_global_gc; zombies that are still
+     * referenced after that keep it settled, so this costs at most two global cycles per
+     * drop to one Ractor. */
+    if (rb_gc_vm_ractor_count() == 1 && !global_objspace->sole_ractor_settled) return true;
     return gc_zombie_pages_due_p();
 }
 
@@ -11023,6 +11038,7 @@ gc_start_global(rb_objspace_t *driver, unsigned int reason, bool compact, bool a
      * numbers left when a joinable (slotted) zombie retires without any pass merging it. */
     rb_gc_vm_refresh_zombie_pages();
     global_objspace->zombie_pages_survivors = rb_gc_vm_zombie_total_pages();
+    global_objspace->sole_ractor_settled = rb_gc_vm_ractor_count() == 1;
 
     /* If the sweep above collected an unjoined Ractor object, ractor_free disowned its
      * zombie_objspaces entry and posted the merge to main as a postponed job; the objspace
@@ -11366,6 +11382,9 @@ void
 rb_gc_impl_objspace_absorb(void *dst_ptr, void *src_ptr)
 {
     objspace_absorb(dst_ptr, src_ptr);
+    /* The merged objects were last marked under src, so the next global cycle has
+     * something new to see (see gc_need_global_p). */
+    global_objspace->sole_ractor_settled = false;
 }
 
 void

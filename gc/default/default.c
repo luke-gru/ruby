@@ -2491,6 +2491,31 @@ heap_unlink_page(rb_objspace_t *objspace, rb_heap_t *heap, struct heap_page *pag
     heap->total_slots -= page->total_slots;
 }
 
+/* Detach a page with no living objects from its heap and park it on the objspace's
+ * empty pages, from where it is reused or released to the page pool.  The caller has
+ * already taken it off the heap's free_pages chain, if it was on it. */
+static void
+heap_page_detach_empty(rb_objspace_t *objspace, rb_heap_t *heap, struct heap_page *page)
+{
+    heap_unlink_page(objspace, heap, page);
+
+    page->start = 0;
+    page->total_slots = 0;
+    page->slot_size = 0;
+    page->heap = NULL;
+    page->free_slots = 0;
+
+    asan_unlock_freelist(page);
+    page->free_region = NULL;
+    asan_lock_freelist(page);
+
+    asan_poison_memory_region(page->body, HEAP_PAGE_SIZE);
+
+    objspace->empty_pages_count++;
+    page->free_next = objspace->empty_pages;
+    objspace->empty_pages = page;
+}
+
 static void
 gc_aligned_free(void *ptr, size_t size)
 {
@@ -6752,23 +6777,7 @@ gc_sweep_step(rb_objspace_t *objspace, rb_heap_t *heap)
         if (free_slots == sweep_page->total_slots && heap->total_pages > 1) {
             /* There are no living objects, so move this page to the global empty pages.
              * The last one stays: nothing grows a heap that has no pages at all. */
-            heap_unlink_page(objspace, heap, sweep_page);
-
-            sweep_page->start = 0;
-            sweep_page->total_slots = 0;
-            sweep_page->slot_size = 0;
-            sweep_page->heap = NULL;
-            sweep_page->free_slots = 0;
-
-            asan_unlock_freelist(sweep_page);
-            sweep_page->free_region = NULL;
-            asan_lock_freelist(sweep_page);
-
-            asan_poison_memory_region(sweep_page->body, HEAP_PAGE_SIZE);
-
-            objspace->empty_pages_count++;
-            sweep_page->free_next = objspace->empty_pages;
-            objspace->empty_pages = sweep_page;
+            heap_page_detach_empty(objspace, heap, sweep_page);
         }
         else if (free_slots > 0) {
             heap->freed_slots += ctx.freed_slots;
@@ -11103,6 +11112,36 @@ objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
          * gc_start_global step 3). */
         for (int h = 0; h < HEAP_COUNT; h++) {
             heap_move_pooled_pages_to_free_pages(&heaps[h]);
+        }
+
+        /* A dead Ractor's heaps hold mostly empty pages that the sweep left attached:
+         * it keeps each heap's last page, and a small Ractor has one page per heap it
+         * used.  src never allocates again, so detach every page with no living objects
+         * here and the handover below releases it to the pool with the rest of src's
+         * empty pages, instead of dst inheriting it.  src is fully swept and has no
+         * allocation page (both settled above), so free_slots is exact or, for a page
+         * allocated from since its sweep, 0; T_ZOMBIE slots are not counted free, so a
+         * page still waiting on a finalizer is kept. */
+        for (int h = 0; h < HEAP_COUNT; h++) {
+            rb_heap_t *heap = &heaps[h];
+            struct heap_page **link = &heap->free_pages;
+            while (*link) {
+                struct heap_page *page = *link;
+                if (page->free_slots == page->total_slots) {
+                    *link = page->free_next;
+                }
+                else {
+                    link = &page->free_next;
+                }
+            }
+
+            struct heap_page *page, *next;
+            ccan_list_for_each_safe(&heap->pages, page, next, page_node) {
+                if (page->free_slots == page->total_slots) {
+                    GC_ASSERT(page->final_slots == 0);
+                    heap_page_detach_empty(objspace, heap, page);
+                }
+            }
         }
     }
 

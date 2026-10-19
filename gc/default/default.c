@@ -9862,6 +9862,17 @@ gc_start_record(rb_objspace_t *objspace, unsigned int reason, bool full_mark)
 
 static bool gc_start_global(rb_objspace_t *driver, unsigned int reason, bool compact, bool allow_skip);
 
+/* A zombie's garbage only a global cycle reclaims, but what survived the last one is
+ * live data, so retrigger only once TRIGGER more pages accumulate on top of it.
+ * Otherwise one live-heavy unjoined zombie turns every GC stop-the-world forever. */
+static bool
+gc_zombie_pages_due_p(void)
+{
+    size_t zp = rb_gc_vm_zombie_total_pages();
+    size_t base = global_objspace->zombie_pages_survivors < zp ? global_objspace->zombie_pages_survivors : zp;
+    return zp - base >= ZOMBIE_PAGES_TRIGGER;
+}
+
 /* Decide whether this collection has to be global.  A local GC can reclaim neither
  * shareable objects nor zombie objspaces, so once those grow past their limits only a
  * global GC makes progress.  All inputs belong to this objspace. */
@@ -9872,15 +9883,7 @@ gc_need_global_p(rb_objspace_t *objspace)
     /* A Ractor's death must not stop the world, so the retire GC stays local. */
     if (objspace->flags.during_postmortem) return false;
     if (objspace->shareable_objects > objspace->shareable_objects_limit) return true;
-    /* A zombie's garbage only a global cycle reclaims, but what survived the last one
-     * is live data, so retrigger only once TRIGGER more pages accumulate on top of it.
-     * Otherwise one live-heavy unjoined zombie turns every GC stop-the-world forever. */
-    {
-        size_t zp = rb_gc_vm_zombie_total_pages();
-        size_t base = global_objspace->zombie_pages_survivors < zp ? global_objspace->zombie_pages_survivors : zp;
-        if (zp - base >= ZOMBIE_PAGES_TRIGGER) return true;
-    }
-    return false;
+    return gc_zombie_pages_due_p();
 }
 
 static int
@@ -10496,6 +10499,26 @@ garbage_collect_with_gvl(rb_objspace_t *objspace, unsigned int reason)
     else {
         return garbage_collect(objspace, reason);
     }
+}
+
+bool
+rb_gc_impl_zombie_gc_due_p(void *objspace_ptr)
+{
+    if (rb_gc_single_objspace_p()) return false;
+    return gc_zombie_pages_due_p();
+}
+
+/* The global GC a retiring Ractor handed to this one (rb_gc_objspace_retire).  Any GC
+ * since then may already have collected the zombies, so check again; a non-METHOD
+ * reason is what lets gc_start promote the collection to global via gc_need_global_p,
+ * and garbage_collect_with_gvl respects GC.disable like any automatic GC. */
+void
+rb_gc_impl_zombie_gc(void *objspace_ptr)
+{
+    rb_objspace_t *objspace = objspace_ptr;
+
+    if (!rb_gc_impl_zombie_gc_due_p(objspace)) return;
+    garbage_collect_with_gvl(objspace, GPR_DEFAULT_REASON);
 }
 
 static int

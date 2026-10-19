@@ -1854,6 +1854,18 @@ rb_gc_impl_heap_page_count(void *objspace_ptr)
     return 0;
 }
 
+bool
+rb_gc_impl_zombie_gc_due_p(void *objspace_ptr)
+{
+    /* With a single objspace there are no zombie objspaces. */
+    return false;
+}
+
+void
+rb_gc_impl_zombie_gc(void *objspace_ptr)
+{
+}
+
 void
 rb_gc_impl_objspace_absorb(void *dst_ptr, void *src_ptr)
 {

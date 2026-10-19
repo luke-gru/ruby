@@ -831,6 +831,9 @@ typedef struct rb_vm_struct {
          * one (rb_postponed_job_handle_t; POSTPONED_JOB_HANDLE_INVALID when not
          * registered). */
         unsigned int orphan_merge_pjob;
+        /* Handle of the postponed job a retiring Ractor posts to main when its zombie
+         * objspace crosses the zombie-pages trigger (same encoding as orphan_merge_pjob). */
+        unsigned int zombie_gc_pjob;
         /* Used to resolve the objspace during VM teardown (the cleanup path of
          * rb_gc_get_objspace). */
         void *cleanup_objspace;

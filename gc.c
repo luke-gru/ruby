@@ -680,6 +680,8 @@ typedef struct gc_function_map {
     bool (*obj_foreign_p)(void *objspace_ptr, VALUE obj);
     bool (*shref_marked_p)(void *objspace_ptr, VALUE obj);
     size_t (*heap_page_count)(void *objspace_ptr);
+    bool (*zombie_gc_due_p)(void *objspace_ptr);
+    void (*zombie_gc)(void *objspace_ptr);
     void (*objspace_absorb)(void *dst_ptr, void *src_ptr);
     void (*gc_rest)(void *objspace_ptr);
     VALUE (*config_get)(void *objpace_ptr);
@@ -875,6 +877,8 @@ ruby_modular_gc_init(void)
     load_modular_gc_func(obj_foreign_p);
     load_modular_gc_func(shref_marked_p);
     load_modular_gc_func(heap_page_count);
+    load_modular_gc_func(zombie_gc_due_p);
+    load_modular_gc_func(zombie_gc);
     load_modular_gc_func(objspace_absorb);
     load_modular_gc_func(gc_rest);
     load_modular_gc_func(config_set);
@@ -979,6 +983,8 @@ ruby_modular_gc_init(void)
 # define rb_gc_impl_obj_foreign_p rb_gc_functions.obj_foreign_p
 # define rb_gc_impl_shref_marked_p rb_gc_functions.shref_marked_p
 # define rb_gc_impl_heap_page_count rb_gc_functions.heap_page_count
+# define rb_gc_impl_zombie_gc_due_p rb_gc_functions.zombie_gc_due_p
+# define rb_gc_impl_zombie_gc rb_gc_functions.zombie_gc
 # define rb_gc_impl_objspace_absorb rb_gc_functions.objspace_absorb
 # define rb_gc_impl_gc_rest rb_gc_functions.gc_rest
 # define rb_gc_impl_config_get rb_gc_functions.config_get
@@ -4428,6 +4434,7 @@ rb_gc_vm_each_objspace(void (*func)(void *objspace, void *data), void *data)
  * the GC cycle that discovered the orphan. */
 
 static void gc_orphan_merge_job(void *unused);
+static void gc_zombie_gc_job(void *unused);
 
 /* Grown with plain realloc: rb_gc_objspace_disown pushes from inside a global GC
  * sweep, where the accounting allocator is not allowed.  This table is VM-lifetime
@@ -4472,6 +4479,18 @@ gc_orphan_merge_pjob_ensure(void)
     }
 }
 
+/* Reserve the handle of the zombie GC job (see rb_gc_objspace_retire). */
+static void
+gc_zombie_gc_pjob_ensure(void)
+{
+    if (GET_VM()->gc.zombie_gc_pjob == POSTPONED_JOB_HANDLE_INVALID) {
+        GET_VM()->gc.zombie_gc_pjob = rb_postponed_job_preregister(0, gc_zombie_gc_job, NULL);
+        if (GET_VM()->gc.zombie_gc_pjob == POSTPONED_JOB_HANDLE_INVALID) {
+            rb_bug("Could not preregister postponed job for GC");
+        }
+    }
+}
+
 /* A terminating Ractor runs the last local GC of its own objspace; own thread only. */
 void
 rb_gc_objspace_retire_gc(void)
@@ -4504,6 +4523,16 @@ rb_gc_objspace_retire(void **objspace_slot)
         struct rb_ractor_struct *owner =
             (struct rb_ractor_struct *)((char *)objspace_slot - offsetof(rb_ractor_t, objspace));
         zombie_objspaces_push(vm, *objspace_slot, objspace_slot, owner);
+
+        /* Only a live Ractor's automatic GC checks the zombie trigger: the retire GC
+         * stays local so a Ractor's death never stops the world.  Without this, Ractors
+         * that die before ever running a GC of their own pile up as zombies until main
+         * happens to collect.  Hand the global GC to main instead; the trigger is
+         * wait-free and coalesces, so a burst of deaths posts it once. */
+        if (rb_gc_impl_zombie_gc_due_p(*objspace_slot)) {
+            gc_zombie_gc_pjob_ensure();
+            rb_postponed_job_trigger_for_ractor(vm->gc.zombie_gc_pjob, vm->ractor.main_ractor->pub.self);
+        }
     }
 }
 
@@ -4729,6 +4758,13 @@ gc_orphan_merge_job(void *unused)
 {
     (void)unused;
     objspace_absorb_disowned_zombies();
+}
+
+static void
+gc_zombie_gc_job(void *unused)
+{
+    (void)unused;
+    rb_gc_impl_zombie_gc(rb_gc_get_objspace());
 }
 
 /* Re-target a pending orphan merge after fork.  The job may target the parent's main

@@ -2936,6 +2936,27 @@ STATIC_ASSERT(page_pool_unmap_after_advise,
 static rb_hrtime_t page_pool_advise_idle = PAGE_POOL_MSEC2HRTIME(PAGE_POOL_ADVISE_IDLE_MSEC);
 static rb_hrtime_t page_pool_unmap_idle = PAGE_POOL_MSEC2HRTIME(PAGE_POOL_UNMAP_IDLE_MSEC);
 
+/* Advising a body returns it to the OS immediately (MADV_DONTNEED), so the drop in RSS
+ * happens when page_pool_reclaim runs rather than whenever the kernel next needs the
+ * memory.  The cost is that reacquiring it zero-faults.  RUBY_GC_LAZY_PAGE_PURGE=1 asks
+ * for MADV_FREE instead, which leaves the pages resident and reclaimable, so a body that
+ * is reacquired before the kernel takes it comes back without faulting. */
+#ifndef PAGE_POOL_LAZY_PURGE_DEFAULT
+# define PAGE_POOL_LAZY_PURGE_DEFAULT 0
+#endif
+static bool page_pool_lazy_purge = PAGE_POOL_LAZY_PURGE_DEFAULT;
+
+static inline void
+page_pool_advise(void *addr, size_t len)
+{
+    if (page_pool_lazy_purge) {
+        rb_vm_map_reusable_lazy(addr, len, 0);
+    }
+    else {
+        rb_vm_map_reusable_immediate(addr, len, 0);
+    }
+}
+
 /* The warm floor halves every page_pool_floor_half_life without demand.  The acquire rate
  * it is sized from is sampled in page_pool_acquire, so these bound a window of allocation
  * traffic.  Below PAGE_POOL_RATE_MIN_WINDOW the window keeps accumulating, so a tight
@@ -3471,8 +3492,8 @@ page_pool_reclaim(rb_global_objspace_t *g, size_t budget)
             base += skip;
             int run_len = ntz_int64(~left);
 
-            rb_vm_map_reusable_lazy(page_pool_body_at(a, base),
-                                    (size_t)run_len * HEAP_PAGE_SIZE, 0);
+            page_pool_advise(page_pool_body_at(a, base),
+                             (size_t)run_len * HEAP_PAGE_SIZE);
             for (int j = base; j < base + run_len; j++) {
                 a->bodies[j].advised = true;
             }
@@ -12634,6 +12655,20 @@ rb_gc_impl_set_params(void *objspace_ptr)
     }
     if (page_pool_unmap_idle < page_pool_advise_idle) {
         page_pool_unmap_idle = page_pool_advise_idle;
+    }
+
+    /* get_envparam_size rejects 0, which is the value that has to select immediate
+     * release, so this one is parsed here. */
+    const char *lazy_purge = getenv("RUBY_GC_LAZY_PAGE_PURGE");
+    if (lazy_purge != NULL && *lazy_purge != '\0') {
+        char *end;
+        long val = strtol(lazy_purge, &end, 10);
+        if (*end == '\0') {
+            page_pool_lazy_purge = (val != 0);
+        }
+        else if (RTEST(ruby_verbose)) {
+            fprintf(stderr, "invalid value for RUBY_GC_LAZY_PAGE_PURGE: %s\n", lazy_purge);
+        }
     }
 
 #if USE_PAGE_POOL_THREAD

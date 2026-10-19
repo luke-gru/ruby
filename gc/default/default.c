@@ -934,6 +934,11 @@ typedef struct rb_global_objspace {
          * lock while holding it. */
         rb_nativethread_lock_t wake_lock;
         rb_nativethread_cond_t wake_cond;
+        /* wake_cond is initialized by the first thread start, not with the rest of the
+         * pool: global_objspace_init runs before Init_native_thread sets CLOCK_MONOTONIC
+         * on the condattr, and a REALTIME condvar would read every rb_hrtime_now()
+         * deadline as long past, turning the timed wait into a spin. */
+        bool wake_cond_initialized;
         rb_nativethread_id_t thread_id;
         enum page_pool_thread_state thread_state;
         /* The deadline the reclaimer is guaranteed to wake at, published for notifiers to
@@ -1090,7 +1095,7 @@ global_objspace_init(void)
         ATOMIC_U64_SET_RELAXED(g->page_pool.next_due, RB_HRTIME_MAX);
 #if USE_PAGE_POOL_THREAD
         page_pool_lock_initialize(&g->page_pool.wake_lock);
-        rb_native_cond_initialize(&g->page_pool.wake_cond);
+        g->page_pool.wake_cond_initialized = false;
         g->page_pool.thread_state = PAGE_POOL_THREAD_STOPPED;
         ATOMIC_U64_SET_RELAXED(g->page_pool.thread_armed_until, RB_HRTIME_MAX);
         g->page_pool.thread_stopped_for_fork = false;
@@ -3677,6 +3682,11 @@ page_pool_thread_start_locked(rb_global_objspace_t *g)
 {
     GC_ASSERT(g->page_pool.thread_state == PAGE_POOL_THREAD_STOPPED);
 
+    if (!g->page_pool.wake_cond_initialized) {
+        rb_native_cond_initialize(&g->page_pool.wake_cond);
+        g->page_pool.wake_cond_initialized = true;
+    }
+
     /* The reclaimer has no Ruby thread to deliver a signal to, so mask everything across
      * the create and let it inherit an empty set. */
     sigset_t set, oldset;
@@ -3775,7 +3785,9 @@ page_pool_thread_after_fork(rb_global_objspace_t *g, bool child)
 {
     if (child) {
         page_pool_lock_initialize(&g->page_pool.wake_lock);
-        rb_native_cond_initialize(&g->page_pool.wake_cond);
+        if (g->page_pool.wake_cond_initialized) {
+            rb_native_cond_initialize(&g->page_pool.wake_cond);
+        }
     }
 
     rb_native_mutex_lock(&g->page_pool.wake_lock);

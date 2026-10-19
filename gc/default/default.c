@@ -941,6 +941,11 @@ typedef struct rb_global_objspace {
         bool wake_cond_initialized;
         rb_nativethread_id_t thread_id;
         enum page_pool_thread_state thread_state;
+        /* Cumulative wakeups actually delivered to the reclaimer, written under
+         * wake_lock (for GC.stat).  Releases the wake slack absorbed are not counted, so
+         * this is the signalling the pool could not avoid rather than the number of times
+         * page_pool_thread_notify was called. */
+        size_t thread_notifications;
         /* The deadline the reclaimer is guaranteed to wake at, published for notifiers to
          * read without wake_lock: 0 while it is awake, RB_HRTIME_MAX when it will not wake
          * on its own (indefinite sleep, or no thread). */
@@ -1097,6 +1102,7 @@ global_objspace_init(void)
         page_pool_lock_initialize(&g->page_pool.wake_lock);
         g->page_pool.wake_cond_initialized = false;
         g->page_pool.thread_state = PAGE_POOL_THREAD_STOPPED;
+        g->page_pool.thread_notifications = 0;
         ATOMIC_U64_SET_RELAXED(g->page_pool.thread_armed_until, RB_HRTIME_MAX);
         g->page_pool.thread_stopped_for_fork = false;
 #endif
@@ -3751,9 +3757,11 @@ page_pool_thread_notify(rb_global_objspace_t *g)
     switch (g->page_pool.thread_state) {
       case PAGE_POOL_THREAD_STOPPED:
         page_pool_thread_start_locked(g);
+        g->page_pool.thread_notifications++;
         break;
       case PAGE_POOL_THREAD_RUNNING:
         rb_native_cond_signal(&g->page_pool.wake_cond);
+        g->page_pool.thread_notifications++;
         break;
       case PAGE_POOL_THREAD_STOPPING:
       case PAGE_POOL_THREAD_FAILED:
@@ -12047,6 +12055,9 @@ enum gc_stat_sym {
     gc_stat_sym_page_pool_reuses,
     gc_stat_sym_page_pool_free_pages,
     gc_stat_sym_page_pool_warm_floor,
+#if USE_PAGE_POOL_THREAD
+    gc_stat_sym_page_pool_thread_notifications,
+#endif
     gc_stat_sym_last
 };
 
@@ -12108,6 +12119,9 @@ setup_gc_stat_symbols(void)
     S(page_pool_reuses);
     S(page_pool_free_pages);
     S(page_pool_warm_floor);
+#if USE_PAGE_POOL_THREAD
+    S(page_pool_thread_notifications);
+#endif
 #undef S
 }
 
@@ -12272,6 +12286,9 @@ rb_gc_impl_stat(void *objspace_ptr, VALUE hash_or_sym)
     SET(page_pool_reuses, global_objspace->page_pool.reuse_calls);
     SET(page_pool_free_pages, global_objspace->page_pool.free_count_total);
     SET(page_pool_warm_floor, global_objspace->page_pool.warm_floor);
+#if USE_PAGE_POOL_THREAD
+    SET(page_pool_thread_notifications, global_objspace->page_pool.thread_notifications);
+#endif
 
 #if RGENGC_PROFILE
     SET(total_generated_normal_object_count, objspace->profile.total_generated_normal_object_count);

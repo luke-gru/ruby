@@ -81,8 +81,9 @@ MODULAR_GC_FN void rb_gc_each_registered_addr(rb_gc_registered_addr_cb func, voi
 MODULAR_GC_FN bool rb_gc_registered_addr_owned_by_registrant_p(VALUE *addr, void *objspace);
 MODULAR_GC_FN bool rb_gc_vm_zombie_objspace_p(void *objspace);
 MODULAR_GC_FN size_t rb_gc_vm_zombie_total_pages(void);
+MODULAR_GC_FN size_t rb_gc_vm_zombie_objspaces_count(void);
 MODULAR_GC_FN unsigned int rb_gc_vm_ractor_count(void);
-MODULAR_GC_FN void rb_gc_vm_refresh_zombie_pages(void);
+MODULAR_GC_FN size_t rb_gc_vm_refresh_zombie_pages(void);
 /* No MODULAR_GC_FN: the VM side (ractor.c) calls this too, so it needs external
  * linkage even in a non-modular build (see internal/gc.h). */
 bool rb_gc_single_objspace_p(void);

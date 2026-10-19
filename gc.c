@@ -4607,18 +4607,22 @@ rb_gc_vm_ractor_count(void)
     return GET_VM()->ractor.cnt;
 }
 
-/* Called by a global cycle from inside the barrier. */
-void
+/* Called by a global cycle from inside the barrier, after its sweep.  Returns the pages
+ * of the zombies still owned: the sweep has freed the Ractor objects of the others, which
+ * disowned them, so they are garbage waiting to be absorbed rather than survivors. */
+size_t
 rb_gc_vm_refresh_zombie_pages(void)
 {
     rb_vm_t *vm = GET_VM();
-    size_t total = 0;
+    size_t total = 0, owned = 0;
     for (size_t i = 0; i < vm->gc.zombie_objspaces_count; i++) {
         size_t pages = rb_gc_impl_heap_page_count(vm->gc.zombie_objspaces[i].objspace);
         vm->gc.zombie_objspaces[i].pages = pages;
         total += pages;
+        if (vm->gc.zombie_objspaces[i].owner_slot != NULL) owned += pages;
     }
     vm->gc.zombie_total_pages = total;
+    return owned;
 }
 
 void

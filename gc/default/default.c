@@ -9918,14 +9918,20 @@ gc_start_record(rb_objspace_t *objspace, unsigned int reason, bool full_mark)
 static bool gc_start_global(rb_objspace_t *driver, unsigned int reason, bool compact, bool allow_skip);
 
 /* A zombie's garbage only a global cycle reclaims, but what survived the last one is
- * live data, so retrigger only once TRIGGER more pages accumulate on top of it.
- * Otherwise one live-heavy unjoined zombie turns every GC stop-the-world forever. */
+ * live data, so retrigger only once as many pages again (at least TRIGGER) accumulate on
+ * top of it.  A fixed step would turn every GC stop-the-world forever behind one
+ * live-heavy unjoined zombie, and stop the world every TRIGGER pages while many dying
+ * Ractors are still referenced, each cycle finding almost nothing to free; growing with
+ * the survivors keeps the cycles' cost proportional to what they can reclaim, the way
+ * heap growth does for a local heap. */
 static bool
 gc_zombie_pages_due_p(void)
 {
     size_t zp = rb_gc_vm_zombie_total_pages();
-    size_t base = global_objspace->zombie_pages_survivors < zp ? global_objspace->zombie_pages_survivors : zp;
-    return zp - base >= ZOMBIE_PAGES_TRIGGER;
+    size_t survivors = global_objspace->zombie_pages_survivors;
+    size_t base = survivors < zp ? survivors : zp;
+    size_t step = survivors > ZOMBIE_PAGES_TRIGGER ? survivors : ZOMBIE_PAGES_TRIGGER;
+    return zp - base >= step;
 }
 
 /* Decide whether this collection has to be global.  A local GC can reclaim neither
@@ -11075,9 +11081,11 @@ gc_start_global(rb_objspace_t *driver, unsigned int reason, bool compact, bool a
 
     /* Re-measure the zombie_objspaces table now that the garbage is gone; entries are stable
      * inside the barrier.  Without this, the page trigger above keeps firing on the stale
-     * numbers left when a joinable (slotted) zombie retires without any pass merging it. */
-    rb_gc_vm_refresh_zombie_pages();
-    global_objspace->zombie_pages_survivors = rb_gc_vm_zombie_total_pages();
+     * numbers left when a joinable (slotted) zombie retires without any pass merging it.
+     * Survivors are only the zombies still owned: one this sweep disowned is absorbed right
+     * after the cycle, and counting it would raise the baseline by all the garbage just
+     * found, so the next trigger would wait for the backlog to grow back to this size. */
+    global_objspace->zombie_pages_survivors = rb_gc_vm_refresh_zombie_pages();
     global_objspace->sole_ractor_settled = rb_gc_vm_ractor_count() == 1;
 
     /* If the sweep above collected an unjoined Ractor object, ractor_free disowned its

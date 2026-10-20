@@ -4536,8 +4536,8 @@ rb_gc_objspace_retire(void **objspace_slot)
     }
 }
 
-/* The owning Ractor object was collected, so nobody can join any more: drop the owner
- * slot in zombie_objspaces and hand the merge to main.  Called from ractor_free (inside
+/* The owning Ractor object was collected, so nobody can absorb anymore: drop the owner
+ * slot in zombie_objspaces and hand the absorb to main. Called from ractor_free (inside
  * a sweep), where the accounting allocator is unavailable; the table itself is stable. */
 void
 rb_gc_objspace_disown(void *objspace)

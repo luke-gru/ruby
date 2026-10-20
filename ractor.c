@@ -472,7 +472,7 @@ ractor_free(void *ptr)
         r->newobj_cache = NULL;
     }
 
-    /* Died unjoined and the handle is collected: nobody can inherit it.  We are in a
+    /* Died without successor (Ractor#value) and the handle is collected: nobody can inherit it. We are in a
      * sweep under the global GC barrier, so disown the zombie_objspaces entry and post
      * the merge to main.  main itself only gets here in the free-at-exit walk: leave it
      * and its objspace to VM destruct. */

@@ -697,6 +697,10 @@ typedef struct rb_objspace {
         unsigned int during_minor_gc : 1;
         unsigned int during_incremental_marking : 1;
         unsigned int during_postmortem : 1;
+        /* No Ractor owns this objspace any more, so it will never allocate again.  Set
+         * once at retirement and never cleared; unlike during_postmortem it stays true
+         * for the zombie's later sweeps by a global GC. */
+        unsigned int ownerless : 1;
         unsigned int measure_gc : 1;
     } flags;
 
@@ -6664,6 +6668,12 @@ gc_sweep_start(rb_objspace_t *objspace)
 static void
 gc_sweep_finish_heap(rb_objspace_t *objspace, rb_heap_t *heap)
 {
+    /* Nothing allocates from an ownerless objspace again, so it has no growth decision
+     * to make, and resurrecting here would pull back the empty pages the sweep just
+     * detached -- a heap that keeps >80% of its slots live still satisfies the guard
+     * below while its siblings are filling objspace->empty_pages. */
+    if (objspace->flags.ownerless) return;
+
     size_t total_slots = heap->total_slots;
     size_t swept_slots = heap->freed_slots + heap->empty_slots;
 
@@ -6820,9 +6830,11 @@ gc_sweep_step(rb_objspace_t *objspace, rb_heap_t *heap)
 
         heap->sweeping_page = ccan_list_next(&heap->pages, sweep_page, page_node);
 
-        if (free_slots == sweep_page->total_slots && heap->total_pages > 1) {
+        if (free_slots == sweep_page->total_slots &&
+                (heap->total_pages > 1 || objspace->flags.ownerless)) {
             /* There are no living objects, so move this page to the global empty pages.
-             * The last one stays: nothing grows a heap that has no pages at all. */
+             * The last one stays so the heap has something to grow from -- except in an
+             * ownerless objspace, which will never allocate again. */
             heap_page_detach_empty(objspace, heap, sweep_page);
         }
         else if (free_slots > 0) {
@@ -9774,6 +9786,7 @@ rb_gc_impl_objspace_retire_gc(void *objspace_ptr)
     /* The dying thread's stack is already torn down here, so the root scan must skip
      * its machine context (rb_gc_mark_roots). */
     objspace->flags.during_postmortem = 1;
+    objspace->flags.ownerless = 1;
 
     gc_rest(objspace);
     gc_start(objspace, GPR_FLAG_FULL_MARK | GPR_FLAG_IMMEDIATE_MARK | GPR_FLAG_IMMEDIATE_SWEEP);
@@ -11168,6 +11181,9 @@ objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
             gc_abort_incremental_marking(objspace);
             gc_make_mid_mark_objspace_absorbable(objspace);
         }
+        /* rb_ractor_terminate_atfork retires without the retire GC, so src may arrive
+         * with the flag unset; the sweep gc_rest may finish is the last one it gets. */
+        objspace->flags.ownerless = 1;
         gc_rest(src); // if mid-sweep
         heap_alloc_state_clear(objspace);
         /* gc_sweep_finish leaves swept pages "pooled" for a coming incremental mark; src

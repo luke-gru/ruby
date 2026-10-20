@@ -10657,12 +10657,19 @@ rb_gc_impl_shref_marked_p(void *objspace_ptr, VALUE obj)
     return MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(obj), obj) != 0;
 }
 
-/* The objspace's current page count (used for the zombie_objspaces page accounting). */
+/* The objspace's page count for the zombie_objspaces page accounting.  A heap with no
+ * pages still counts as one: the retire GC can empty an ownerless objspace completely,
+ * yet the objspace itself (its struct, mark stack and heap_page structs) stays in malloc
+ * until a global GC, so a page-less zombie must still push the zombie trigger. */
 size_t
 rb_gc_impl_heap_page_count(void *objspace_ptr)
 {
     rb_objspace_t *objspace = objspace_ptr;
-    return rb_darray_size(objspace->heap_pages.sorted);
+    size_t pages = rb_darray_size(objspace->heap_pages.sorted);
+    for (int i = 0; i < HEAP_COUNT; i++) {
+        if (heaps[i].total_pages == 0) pages++;
+    }
+    return pages;
 }
 
 static void

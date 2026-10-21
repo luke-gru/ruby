@@ -6771,7 +6771,11 @@ gc_sweep_finish(rb_objspace_t *objspace)
      * malloc_increase (objspace_malloc_increase_body sweeps and retries on it). */
     gc_malloc_counters_snapshot_free_at_last_gc(objspace, &objspace->malloc_counters.counters);
 #if RGENGC_ESTIMATE_OLDMALLOC
-    gc_malloc_counters_snapshot_free_at_last_gc(objspace, &objspace->malloc_counters.oldcounters);
+    /* oldmalloc_increase accumulates across minors, so only a major's sweep
+     * starts a new window that its own frees must not pay for. */
+    if (is_full_marking(objspace)) {
+        gc_malloc_counters_snapshot_free_at_last_gc(objspace, &objspace->malloc_counters.oldcounters);
+    }
 #endif
 
     /* Leftovers from an earlier multi-Ractor phase: no later sweep can rediscover them
@@ -9878,8 +9882,8 @@ gc_reset_malloc_info(rb_objspace_t *objspace, bool full_mark)
 #if RGENGC_ESTIMATE_OLDMALLOC
     if (!full_mark) {
         /* No full snapshot on minor GC: oldmalloc_increase accumulates across
-         * minors and resets at major GC.  (gc_sweep_finish still advances the
-         * free baseline after every sweep.) */
+         * minors and resets at major GC.  (gc_sweep_finish advances the free
+         * baseline only after a major's sweep.) */
         int64_t oldmalloc_increase = gc_malloc_counters_increase(objspace, &objspace->malloc_counters.oldcounters);
         if (oldmalloc_increase > 0 &&
             (uint64_t)oldmalloc_increase > objspace->rgengc.oldmalloc_increase_limit) {

@@ -49,6 +49,12 @@ VALUE rb_managed_id_table_create(const rb_data_type_t *type, size_t capa);
 VALUE rb_managed_id_table_new(size_t capa);
 VALUE rb_managed_id_table_dup(VALUE table);
 int rb_managed_id_table_insert(VALUE table, ID id, VALUE val);
+<<<<<<< Updated upstream
+=======
+int rb_managed_id_table_replace_release(VALUE table, ID id, VALUE val);
+int rb_managed_id_table_insert_concurrent(VALUE table, ID id, VALUE val);
+int rb_managed_id_table_lookup_acquire(VALUE table, ID id, VALUE *valp);
+>>>>>>> Stashed changes
 int rb_managed_id_table_lookup(VALUE table, ID id, VALUE *valp);
 size_t rb_managed_id_table_size(VALUE table);
 void rb_managed_id_table_foreach(VALUE table, rb_id_table_foreach_func_t *func, void *data);

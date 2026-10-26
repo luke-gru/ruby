@@ -184,9 +184,55 @@ VALUE
 rb_vm_cc_table_dup(VALUE old_table)
 {
     ASSERT_vm_locking();
+<<<<<<< Updated upstream
     VALUE new_table = rb_vm_cc_table_create(rb_managed_id_table_size(old_table));
     rb_managed_id_table_foreach(old_table, vm_cc_table_dup_i, (void *)new_table);
     return new_table;
+=======
+    size_t size = rb_managed_id_table_size(old_table);
+    /* A copy is made when the table is full (or to drop invalidated entries), so leave
+     * room to take about as many keys again in place (rb_managed_id_table_insert_concurrent
+     * stops at 2/3 full) before the next one: copies then cost O(1) per key amortized. */
+    struct vm_cc_table_dup_arg arg = {
+        .new_table = rb_managed_id_table_create(&rb_managed_id_table_type, 3 * (size + 2)),
+        .dropped = 0,
+    };
+    rb_managed_id_table_foreach(old_table, vm_cc_table_dup_i, &arg);
+    *dropped = arg.dropped;
+    return arg.new_table;
+}
+
+static enum rb_id_table_iterator_result
+vm_cc_table_retire_invalidated_i(VALUE ccs_ptr, void *data)
+{
+    struct rb_class_cc_entries *ccs = (struct rb_class_cc_entries *)ccs_ptr;
+    if (METHOD_ENTRY_INVALIDATED(ccs->cme)) {
+        rb_vm_ccs_retire(ccs);
+    }
+    return ID_TABLE_CONTINUE;
+}
+
+/* Make new_table (from rb_vm_cc_table_dup) the cc table at *slot in place of
+ * old_table, moving ownership of the ccs they share to it. */
+void
+rb_vm_cc_table_publish(VALUE klass, VALUE *slot, VALUE old_table, VALUE new_table, size_t dropped)
+{
+    ASSERT_vm_locking();
+    VM_ASSERT(*slot == old_table);
+
+    /* Nothing below allocates, so no GC sees both tables owning, or neither. */
+    vm_cc_table_set_type(new_table, &cc_table_type);
+    RB_OBJ_ATOMIC_WRITE(klass, slot, new_table);
+    vm_cc_table_set_type(old_table, &rb_managed_id_table_type);
+
+    /* The copy took its references without a write barrier each. */
+    rb_gc_writebarrier_remember(new_table);
+
+    /* Whatever the copy left behind has no owner now. */
+    if (dropped > 0) {
+        rb_managed_id_table_foreach_values(old_table, vm_cc_table_retire_invalidated_i, NULL);
+    }
+>>>>>>> Stashed changes
 }
 
 static void
@@ -2057,10 +2103,23 @@ cache_callable_method_entry(VALUE klass, ID mid, const rb_callable_method_entry_
 #endif
     }
     else {
+<<<<<<< Updated upstream
         if (rb_multi_ractor_p()) {
             VALUE new_cc_tbl = rb_vm_cc_table_dup(cc_tbl);
             vm_ccs_create(klass, new_cc_tbl, mid, cme);
             RB_OBJ_ATOMIC_WRITE(klass, &RCLASSEXT_CC_TBL(RCLASS_EXT_WRITABLE(klass)), new_cc_tbl);
+=======
+        if (rb_vm_cc_table_shared_p()) {
+            /* Other Ractors read cc_tbl without the VM lock: add in place while it has
+             * room, else publish a larger copy. */
+            if (!vm_ccs_create_in_place(klass, cc_tbl, mid, cme)) {
+                size_t dropped;
+                VALUE new_cc_tbl = rb_vm_cc_table_dup(cc_tbl, &dropped);
+                vm_ccs_create(klass, new_cc_tbl, mid, cme);
+                rb_vm_cc_table_publish(klass, &RCLASSEXT_CC_TBL(RCLASS_EXT_WRITABLE(klass)),
+                                       cc_tbl, new_cc_tbl, dropped);
+            }
+>>>>>>> Stashed changes
         }
         else {
             vm_ccs_create(klass, cc_tbl, mid, cme);
@@ -2110,7 +2169,7 @@ callable_method_entry_or_negative(VALUE klass, ID mid, VALUE *defined_class_ptr)
     VALUE cc_tbl = RUBY_ATOMIC_VALUE_LOAD(RCLASS_WRITABLE_CC_TBL(klass));
     if (cc_tbl) {
         VALUE ccs_data;
-        if (rb_managed_id_table_lookup(cc_tbl, mid, &ccs_data)) {
+        if (rb_managed_id_table_lookup_acquire(cc_tbl, mid, &ccs_data)) {
             struct rb_class_cc_entries *ccs = (struct rb_class_cc_entries *)ccs_data;
             VM_ASSERT(vm_ccs_p(ccs));
 

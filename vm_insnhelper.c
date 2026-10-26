@@ -1982,7 +1982,7 @@ static VALUE vm_call_general(rb_execution_context_t *ec, rb_control_frame_t *reg
 static VALUE vm_mtbl_dump(VALUE klass, ID target_mid);
 
 static struct rb_class_cc_entries *
-vm_ccs_create(VALUE klass, VALUE cc_tbl, ID mid, const rb_callable_method_entry_t *cme)
+vm_ccs_alloc(const rb_callable_method_entry_t *cme)
 {
     int initial_capa = 2;
     struct rb_class_cc_entries *ccs = ruby_xmalloc(vm_ccs_alloc_size(initial_capa));
@@ -1992,9 +1992,34 @@ vm_ccs_create(VALUE klass, VALUE cc_tbl, ID mid, const rb_callable_method_entry_
     ccs->capa = initial_capa;
     ccs->len = 0;
     ccs->cme = cme;
+    return ccs;
+}
+
+static struct rb_class_cc_entries *
+vm_ccs_create(VALUE klass, VALUE cc_tbl, ID mid, const rb_callable_method_entry_t *cme)
+{
+    struct rb_class_cc_entries *ccs = vm_ccs_alloc(cme);
     METHOD_ENTRY_CACHED_SET((rb_callable_method_entry_t *)cme);
 
     rb_managed_id_table_insert(cc_tbl, mid, (VALUE)ccs);
+    RB_OBJ_WRITTEN(cc_tbl, Qundef, cme);
+    return ccs;
+}
+
+/* vm_ccs_create for a published cc_tbl that other Ractors are reading (mid must be
+ * absent): the ccs is complete before its key becomes visible.  Returns NULL, adding
+ * nothing, when cc_tbl is full; the caller then replaces the table with a larger copy
+ * (rb_vm_cc_table_dup), which leaves room for many more in-place adds. */
+static struct rb_class_cc_entries *
+vm_ccs_create_in_place(VALUE klass, VALUE cc_tbl, ID mid, const rb_callable_method_entry_t *cme)
+{
+    struct rb_class_cc_entries *ccs = vm_ccs_alloc(cme);
+
+    if (!rb_managed_id_table_insert_concurrent(cc_tbl, mid, (VALUE)ccs)) {
+        ruby_xfree_sized(ccs, vm_ccs_alloc_size(ccs->capa));
+        return NULL;
+    }
+    METHOD_ENTRY_CACHED_SET((rb_callable_method_entry_t *)cme);
     RB_OBJ_WRITTEN(cc_tbl, Qundef, cme);
     return ccs;
 }
@@ -2119,8 +2144,27 @@ vm_populate_cc(VALUE klass, const struct rb_callinfo * const ci, ID mid)
         // Is this possible after rb_callable_method_entry ?
         cc_tbl = rb_vm_cc_table_create(1);
     }
+<<<<<<< Updated upstream
     else if (rb_multi_ractor_p()) {
         cc_tbl = rb_vm_cc_table_dup(cc_tbl);
+=======
+    else if (rb_vm_cc_table_shared_p()) {
+        /* Other Ractors read the published table without the VM lock.  A new key goes
+         * in place while the table has room, and a cc goes into a live ccs in place
+         * (vm_ccs_push publishes it with a release store of len, or swaps in a larger
+         * ccs).  Only a full table, or an invalidated ccs to drop, takes a copy (see
+         * rb_vm_cc_table_publish).  rb_callable_method_entry above has usually just
+         * created this ccs already. */
+        VALUE ccs_obj;
+        if (rb_managed_id_table_lookup(cc_tbl, mid, &ccs_obj)) {
+            if (METHOD_ENTRY_INVALIDATED(((struct rb_class_cc_entries *)ccs_obj)->cme)) {
+                cc_tbl = rb_vm_cc_table_dup(cc_tbl, &dropped);
+            }
+        }
+        else if (!vm_ccs_create_in_place(klass, cc_tbl, mid, cme)) {
+            cc_tbl = rb_vm_cc_table_dup(cc_tbl, &dropped);
+        }
+>>>>>>> Stashed changes
     }
 
     VM_ASSERT(cme == rb_callable_method_entry(klass, mid));
@@ -2171,7 +2215,7 @@ retry:
         // for doing comparisons in the `for` loop below.
 
         VALUE ccs_obj;
-        if (rb_managed_id_table_lookup(cc_tbl, mid, &ccs_obj)) {
+        if (rb_managed_id_table_lookup_acquire(cc_tbl, mid, &ccs_obj)) {
             ccs = (struct rb_class_cc_entries *)ccs_obj;
             const int ccs_len = ccs->len;
 

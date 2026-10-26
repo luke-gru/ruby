@@ -269,6 +269,48 @@ hash_table_show(struct rb_id_table *tbl)
 }
 #endif
 
+#if SIZEOF_VALUE == 8
+/*
+ * Lock-free readers.  A table that other threads read without a lock can still take new
+ * keys from a single writer, as long as its buffer does not move (no hash_table_extend)
+ * and a slot is never emptied while a reader may be probing it: the writer sets the
+ * collision bits along the probe path and stores the value before it stores the key
+ * with release, and a reader loads keys with acquire.  A reader that misses the new key
+ * finds the table as it was.
+ */
+RBIMPL_STATIC_ASSERT(id_key_fits_atomic, sizeof(id_key_t) == sizeof(rb_atomic_t));
+
+static inline id_key_t
+item_get_key_acquire(struct rb_id_table *tbl, int i)
+{
+    return (id_key_t)rbimpl_atomic_load((volatile rb_atomic_t *)&id_table_keys(tbl)[i], RBIMPL_ATOMIC_ACQUIRE);
+}
+
+static inline void
+item_set_key_release(struct rb_id_table *tbl, int i, id_key_t key)
+{
+    rbimpl_atomic_store((volatile rb_atomic_t *)&id_table_keys(tbl)[i], (rb_atomic_t)key, RBIMPL_ATOMIC_RELEASE);
+}
+
+static int
+hash_table_index_acquire(struct rb_id_table *tbl, id_key_t key)
+{
+    if (tbl->capa > 0) {
+        int mask = tbl->capa - 1;
+        int ix = key & mask;
+        int d = 1;
+        while (key != item_get_key_acquire(tbl, ix)) {
+            if (!ITEM_COLLIDED(tbl, ix))
+                return -1;
+            ix = (ix + d) & mask;
+            d++;
+        }
+        return ix;
+    }
+    return -1;
+}
+#endif
+
 int
 rb_id_table_lookup(struct rb_id_table *tbl, ID id, VALUE *valp)
 {
@@ -465,6 +507,77 @@ rb_managed_id_table_insert(VALUE table, ID id, VALUE val)
     return result;
 }
 
+<<<<<<< Updated upstream
+=======
+/* rb_managed_id_table_lookup for a table that a writer may be adding keys to with
+ * rb_managed_id_table_insert_concurrent while this thread reads it. */
+int
+rb_managed_id_table_lookup_acquire(VALUE table, ID id, VALUE *valp)
+{
+#if SIZEOF_VALUE == 8
+    struct rb_id_table *tbl = managed_id_table_ptr(table);
+    int index = hash_table_index_acquire(tbl, id2key(id));
+    if (index < 0) return FALSE;
+    *valp = ITEM_VALUE(tbl, index);
+    RB_GC_GUARD(table);
+    return TRUE;
+#else
+    return rb_managed_id_table_lookup(table, id, valp);
+#endif
+}
+
+/* Add id, which must be absent, while other threads read the table without a lock
+ * (see hash_table_index_acquire).  The caller is the only writer.  Returns FALSE, and
+ * changes nothing, when the table has no room left without growing: growing moves the
+ * buffer, so the caller has to replace the whole table instead. */
+int
+rb_managed_id_table_insert_concurrent(VALUE table, ID id, VALUE val)
+{
+#if SIZEOF_VALUE == 8
+    struct rb_id_table *tbl = managed_id_table_ptr(table);
+    const id_key_t key = id2key(id);
+
+    /* The same threshold at which rb_id_table_insert would call hash_table_extend. */
+    if (tbl->capa == 0 || tbl->used + (tbl->used >> 1) >= tbl->capa) return FALSE;
+    RUBY_ASSERT(hash_table_index(tbl, key) < 0);
+
+    int mask = tbl->capa - 1;
+    int ix = key & mask;
+    int d = 1;
+    while (ITEM_KEY_ISSET(tbl, ix)) {
+        ITEM_SET_COLLIDED(tbl, ix);
+        ix = (ix + d) & mask;
+        d++;
+    }
+    tbl->num++;
+    if (!ITEM_COLLIDED(tbl, ix)) {
+        tbl->used++;
+    }
+    ITEM_VALUE(tbl, ix) = val;
+    item_set_key_release(tbl, ix, key);
+    RB_GC_GUARD(table);
+    return TRUE;
+#else
+    /* The 32-bit layout packs the collision bit into the key word: always copy. */
+    return FALSE;
+#endif
+}
+
+/* Replace the value of an existing key with a release store, for a table that other
+ * threads read without a lock: a reader that loads the new value also sees everything
+ * written before it.  Returns FALSE (and stores nothing) if id is absent. */
+int
+rb_managed_id_table_replace_release(VALUE table, ID id, VALUE val)
+{
+    struct rb_id_table *tbl = managed_id_table_ptr(table);
+    int index = hash_table_index(tbl, id2key(id));
+    if (index < 0) return FALSE;
+    rbimpl_atomic_value_store(&ITEM_VALUE(tbl, index), val, RBIMPL_ATOMIC_RELEASE);
+    RB_GC_GUARD(table);
+    return TRUE;
+}
+
+>>>>>>> Stashed changes
 size_t
 rb_managed_id_table_size(VALUE table)
 {
